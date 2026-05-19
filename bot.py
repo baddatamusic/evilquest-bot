@@ -671,8 +671,8 @@ def _select_mode_interactive() -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="EvilQuest bot")
-    parser.add_argument("--username",    default="blackberry")
-    parser.add_argument("--password",    default="password")
+    parser.add_argument("--username",    required=True)
+    parser.add_argument("--password",    required=True)
     parser.add_argument("--mode",        choices=["woodcutting", "combat"],
                         help="Bot mode (skips interactive prompt)")
     parser.add_argument("--tree-entity", type=int, default=DEFAULT_TREE_ENTITY)
