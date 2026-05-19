@@ -223,6 +223,11 @@ def find_path(start_x10: int, start_z10: int,
                 continue
             if _is_wall_blocked(cx, cz, nx, nz):
                 continue
+            # Diagonal: reject if either corner tile is blocked (would cross through water/terrain).
+            # Skip this check when standing on a blocked tile (server-placed at spawn/respawn).
+            if dx != 0 and dz != 0 and not _is_tile_blocked(cx, cz):
+                if _is_tile_blocked(cx + dx, cz) or _is_tile_blocked(cx, cz + dz):
+                    continue
             ng = g + cost
             if ng < g_score.get((nx, nz), 10**9):
                 g_score[(nx, nz)] = ng
