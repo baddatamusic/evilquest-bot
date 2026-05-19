@@ -4,6 +4,10 @@ A* pathfinder for EvilQuest map navigation.
 Wall bitmask (per tile): N=1, E=2, S=4, W=8
 Wall data: fetched from /maps/kcmap/walls.json as {"x,z": bitmask, ...}
 
+Tile blocking: fetched from /maps/kcmap/tiles/chunk_CX_CZ.json
+  Keys are "row,col" (local z, local x within 64x64 chunk).
+  Tiles with waterSurface or waterPainted properties are impassable.
+
 Coordinate systems:
   - x10 coords: what OP_OWN_STATE and PLAYER_MOVE packets use (e.g. 1265, 1765)
   - tile coords: x10 // 10  (e.g. 126, 176)
@@ -13,11 +17,12 @@ Coordinate systems:
 import heapq
 import json
 import urllib.request
-from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-MAP_ID   = "kcmap"
-MAP_W    = 320
-MAP_H    = 256
+MAP_ID     = "kcmap"
+MAP_W      = 320
+MAP_H      = 256
+CHUNK_SIZE = 64
 
 # Wall direction bitmasks
 W_N = 1   # north wall on this tile (blocks moving to tile z-1)
@@ -27,6 +32,11 @@ W_W = 8   # west wall  (blocks moving to tile x-1)
 
 _walls: dict[tuple[int,int], int] = {}
 _loaded = False
+
+_blocked_tiles: set[tuple[int,int]] = set()
+_tiles_loaded = False
+
+_WATER_PROPS = {"waterSurface", "waterPainted"}
 
 
 def load_walls(walls_json_path: str | None = None):
@@ -51,8 +61,50 @@ def load_walls(walls_json_path: str | None = None):
     _loaded = True
 
 
+def _fetch_chunk(cx: int, cz: int) -> set[tuple[int,int]]:
+    """Fetch one tile chunk and return the set of blocked (water) tile coords."""
+    blocked: set[tuple[int,int]] = set()
+    url = f"https://evilquest.net/maps/{MAP_ID}/tiles/chunk_{cx}_{cz}.json"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read())
+        base_x = cx * CHUNK_SIZE
+        base_z = cz * CHUNK_SIZE
+        for key, props in data.items():
+            row_str, col_str = key.split(",")
+            local_z, local_x = int(row_str), int(col_str)
+            if any(k in _WATER_PROPS for k in props):
+                blocked.add((base_x + local_x, base_z + local_z))
+    except Exception:
+        pass
+    return blocked
+
+
+def load_tiles():
+    """Fetch all tile chunks in parallel and populate the blocked-tile set."""
+    global _blocked_tiles, _tiles_loaded
+    if _tiles_loaded:
+        return
+
+    num_cx = (MAP_W + CHUNK_SIZE - 1) // CHUNK_SIZE  # 5
+    num_cz = (MAP_H + CHUNK_SIZE - 1) // CHUNK_SIZE  # 4
+    chunks = [(cx, cz) for cx in range(num_cx) for cz in range(num_cz)]
+
+    _blocked_tiles.clear()
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_fetch_chunk, cx, cz): (cx, cz) for cx, cz in chunks}
+        for fut in as_completed(futures):
+            _blocked_tiles.update(fut.result())
+
+    _tiles_loaded = True
+
+
 def _wall_at(tx: int, tz: int) -> int:
     return _walls.get((tx, tz), 0)
+
+
+def _is_tile_blocked(tx: int, tz: int) -> bool:
+    return (tx, tz) in _blocked_tiles
 
 
 def _is_wall_blocked(fx: int, fz: int, tx: int, tz: int) -> bool:
@@ -95,22 +147,24 @@ def _in_bounds(tx: int, tz: int) -> bool:
 
 
 # 4-directional + diagonal neighbours
-_DIRS = [(0,-1),(1,0),(0,1),(-1,0),(1,-1),(1,1),(-1,1),(-1,-1)]
-# Diagonal cost slightly higher so cardinal is preferred over diagonal
+_DIRS  = [(0,-1),(1,0),(0,1),(-1,0),(1,-1),(1,1),(-1,1),(-1,-1)]
 _COSTS = [1,1,1,1,2,2,2,2]
 
 
 def _is_tile_fully_walled(tx: int, tz: int) -> bool:
-    """True if a tile is completely surrounded by walls (e.g. an object/tree tile)."""
-    w = _wall_at(tx, tz)
-    return w == (W_N | W_E | W_S | W_W)
+    """True if a tile is impassable — fully walled object tile or a water tile."""
+    if _is_tile_blocked(tx, tz):
+        return True
+    return _wall_at(tx, tz) == (W_N | W_E | W_S | W_W)
 
 
 def _nearest_walkable_adjacent(gx: int, gz: int) -> tuple[int, int] | None:
     """Find the nearest walkable tile adjacent to a blocked destination tile."""
     for dx, dz in [(0,-1),(1,0),(0,1),(-1,0),(1,-1),(1,1),(-1,1),(-1,-1)]:
         nx, nz = gx + dx, gz + dz
-        if _in_bounds(nx, nz) and not _is_wall_blocked(gx, gz, nx, nz):
+        if (_in_bounds(nx, nz)
+                and not _is_tile_blocked(nx, nz)
+                and not _is_wall_blocked(gx, gz, nx, nz)):
             return nx, nz
     return None
 
@@ -121,7 +175,7 @@ def find_path(start_x10: int, start_z10: int,
     """
     A* pathfinding from start to dest.
     Coordinates are x10 (as used in OP_OWN_STATE / PLAYER_MOVE packets).
-    If the destination tile is a blocked object tile (e.g. a tree), automatically
+    If the destination tile is a blocked object/water tile, automatically
     paths to the nearest walkable adjacent tile instead.
     Returns list of (x10, z10) waypoints (NOT including start), or [] if unreachable.
     """
@@ -131,7 +185,7 @@ def find_path(start_x10: int, start_z10: int,
     sx, sz = start_x10 // 10, start_z10 // 10
     gx, gz = dest_x10 // 10,  dest_z10 // 10
 
-    # If destination is a fully-walled tile, redirect to nearest adjacent tile
+    # If destination is impassable, redirect to nearest walkable adjacent tile
     if _is_tile_fully_walled(gx, gz):
         adj = _nearest_walkable_adjacent(gx, gz)
         if adj:
@@ -164,6 +218,8 @@ def find_path(start_x10: int, start_z10: int,
         for (dx, dz), cost in zip(_DIRS, _COSTS):
             nx, nz = cx + dx, cz + dz
             if not _in_bounds(nx, nz):
+                continue
+            if _is_tile_blocked(nx, nz):
                 continue
             if _is_wall_blocked(cx, cz, nx, nz):
                 continue

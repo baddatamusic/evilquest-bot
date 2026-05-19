@@ -591,7 +591,9 @@ class Bot:
         import os
         walls_path = os.path.join(os.path.dirname(__file__), "walls.json")
         pathfinder.load_walls(walls_path if os.path.exists(walls_path) else None)
-        log.info(f"Pathfinder ready — {len(pathfinder._walls)} wall segments loaded")
+        pathfinder.load_tiles()
+        log.info(f"Pathfinder ready — {len(pathfinder._walls)} walls, "
+                 f"{len(pathfinder._blocked_tiles)} blocked tiles loaded")
         token  = await self._http_login()
         ws_url = f"{WS_URL}?token={token}"
 
