@@ -17,12 +17,16 @@ Coordinate systems:
 import heapq
 import json
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 MAP_ID     = "kcmap"
 MAP_W      = 320
 MAP_H      = 256
 CHUNK_SIZE = 64
+
+_GAMEASSETS = Path(__file__).parent / "gameassets" / "maps" / MAP_ID
+_WALLS_PATH = _GAMEASSETS / "walls.json"
+_TILES_DIR  = _GAMEASSETS / "tiles"
 
 # Wall direction bitmasks
 W_N = 1   # north wall on this tile (blocks moving to tile z-1)
@@ -35,23 +39,20 @@ _loaded = False
 
 _blocked_tiles: set[tuple[int,int]] = set()
 _tiles_loaded = False
+_dynamic_blocked: set[tuple[int,int]] = set()
 
 _WATER_PROPS = {"waterSurface", "waterPainted"}
 
 
 def load_walls(walls_json_path: str | None = None):
-    """Load wall data from a local file or fetch from the server."""
+    """Load wall data from the local gameassets file (or an explicit path)."""
     global _walls, _loaded
     if _loaded:
         return
 
-    if walls_json_path:
-        with open(walls_json_path, encoding="utf-8") as f:
-            raw = json.load(f)
-    else:
-        url = f"https://evilquest.net/maps/{MAP_ID}/walls.json"
-        with urllib.request.urlopen(url, timeout=10) as r:
-            raw = json.loads(r.read())
+    path = walls_json_path or str(_WALLS_PATH)
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
 
     _walls.clear()
     for key, bitmask in raw["walls"].items():
@@ -61,13 +62,15 @@ def load_walls(walls_json_path: str | None = None):
     _loaded = True
 
 
-def _fetch_chunk(cx: int, cz: int) -> set[tuple[int,int]]:
-    """Fetch one tile chunk and return the set of blocked (water) tile coords."""
+def _load_chunk(cx: int, cz: int) -> set[tuple[int,int]]:
+    """Load one tile chunk from local gameassets and return blocked (water) tile coords."""
     blocked: set[tuple[int,int]] = set()
-    url = f"https://evilquest.net/maps/{MAP_ID}/tiles/chunk_{cx}_{cz}.json"
+    path = _TILES_DIR / f"chunk_{cx}_{cz}.json"
+    if not path.exists():
+        return blocked
     try:
-        with urllib.request.urlopen(url, timeout=10) as r:
-            data = json.loads(r.read())
+        with open(path) as f:
+            data = json.load(f)
         base_x = cx * CHUNK_SIZE
         base_z = cz * CHUNK_SIZE
         for key, props in data.items():
@@ -81,20 +84,18 @@ def _fetch_chunk(cx: int, cz: int) -> set[tuple[int,int]]:
 
 
 def load_tiles():
-    """Fetch all tile chunks in parallel and populate the blocked-tile set."""
+    """Load all local tile chunks and populate the blocked-tile set."""
     global _blocked_tiles, _tiles_loaded
     if _tiles_loaded:
         return
 
     num_cx = (MAP_W + CHUNK_SIZE - 1) // CHUNK_SIZE  # 5
     num_cz = (MAP_H + CHUNK_SIZE - 1) // CHUNK_SIZE  # 4
-    chunks = [(cx, cz) for cx in range(num_cx) for cz in range(num_cz)]
 
     _blocked_tiles.clear()
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {pool.submit(_fetch_chunk, cx, cz): (cx, cz) for cx, cz in chunks}
-        for fut in as_completed(futures):
-            _blocked_tiles.update(fut.result())
+    for cx in range(num_cx):
+        for cz in range(num_cz):
+            _blocked_tiles.update(_load_chunk(cx, cz))
 
     _tiles_loaded = True
 
@@ -104,7 +105,12 @@ def _wall_at(tx: int, tz: int) -> int:
 
 
 def _is_tile_blocked(tx: int, tz: int) -> bool:
-    return (tx, tz) in _blocked_tiles
+    return (tx, tz) in _blocked_tiles or (tx, tz) in _dynamic_blocked
+
+
+def add_dynamic_block(tx: int, tz: int) -> None:
+    """Add a tile that the server has rejected at runtime (PATH_TRUNCATED feedback)."""
+    _dynamic_blocked.add((tx, tz))
 
 
 def _is_wall_blocked(fx: int, fz: int, tx: int, tz: int) -> bool:
@@ -159,12 +165,15 @@ def _is_tile_fully_walled(tx: int, tz: int) -> bool:
 
 
 def _nearest_walkable_adjacent(gx: int, gz: int) -> tuple[int, int] | None:
-    """Find the nearest walkable tile adjacent to a blocked destination tile."""
+    """Find the nearest walkable tile adjacent to a fully-walled destination.
+
+    Only requires the neighbour itself to be walkable — we don't check the wall
+    between gx/gz and the neighbour because the player only needs to STAND next
+    to the object, not enter its tile.
+    """
     for dx, dz in [(0,-1),(1,0),(0,1),(-1,0),(1,-1),(1,1),(-1,1),(-1,-1)]:
         nx, nz = gx + dx, gz + dz
-        if (_in_bounds(nx, nz)
-                and not _is_tile_blocked(nx, nz)
-                and not _is_wall_blocked(gx, gz, nx, nz)):
+        if _in_bounds(nx, nz) and not _is_tile_fully_walled(nx, nz):
             return nx, nz
     return None
 

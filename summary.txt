@@ -1,0 +1,162 @@
+EvilBot — Change Summary
+========================
+
+1. HTTP Login (bot.py)
+----------------------
+Problem: The original _http_login() used aiohttp and checked for a "ok" field in the
+response that didn't exist.
+
+Fix: Replaced with a synchronous _http_login_sync() using requests, run via
+loop.run_in_executor() so it doesn't block the async loop. The response only contains
+a "token" field, so the check was corrected accordingly.
+
+    # Before
+    async def _http_login(self):
+        async with aiohttp.ClientSession() as s:
+            r = await s.post(..., json={...})
+            data = await r.json()
+            if not data.get("ok"):  # field doesn't exist
+                raise RuntimeError(...)
+
+    # After
+    def _http_login_sync(self) -> str:
+        resp = requests.post(f"{BASE_URL}/api/login", json={...}, timeout=10)
+        resp.raise_for_status()
+        token = resp.json().get("token")  # correct field
+        if not token:
+            raise RuntimeError(f"Login failed: {data}")
+        return token
+
+
+2. WebSocket Transport — new file ws_transport.py
+--------------------------------------------------
+Problem: Every Python WebSocket library (websockets, websocket-client) returns 401 when
+connecting to evilquest.net. Caddy rejects them because they don't send the exact headers
+the server expects.
+
+Root cause discovered: The server authenticates via the Sec-WebSocket-Protocol header
+(auth.<token>), not via a login packet over the wire. Standard libraries either don't let
+you set this header freely, or send slightly different upgrade headers that Caddy rejects.
+
+Fix: Replaced all WebSocket library usage with a raw http.client HTTP/1.1 upgrade,
+sending a full Chrome-like header set:
+
+    conn.request("GET", "/ws/game", headers={
+        "Sec-WebSocket-Protocol":  f"auth.{token}",   # auth mechanism
+        "Sec-WebSocket-Extensions":"permessage-deflate; client_max_window_bits",
+        "User-Agent": "Mozilla/5.0 ... Chrome/124.0.0.0 ...",
+        "Origin": "https://evilquest.net",
+        "Referer": "https://evilquest.net/play",
+        ...
+    })
+
+The raw socket is then wrapped in GameWebSocket, an async class that handles WebSocket
+framing manually.
+
+
+3. Removed Spurious C.LOGIN Packet (bot.py)
+--------------------------------------------
+Problem: The original bot sent pack_str(C.LOGIN, token) as the first game packet after
+connecting, which was wrong — the server had already authenticated via the
+Sec-WebSocket-Protocol header and didn't expect a login packet.
+
+Fix: Removed entirely. The run() method now just connects and waits for LOGIN_OK.
+
+
+4. AES-256-GCM Per-Frame Encryption (ws_transport.py)
+------------------------------------------------------
+Discovery: By reverse-engineering index-C31rgKnD.js from the game's JS bundle, the full
+encryption scheme was recovered:
+
+  - After the server sends LOGIN_OK (opcode 1), all subsequent frames are AES-256-GCM
+    encrypted.
+  - Every encrypted frame is prefixed with 0xFF followed by a 4-byte counter.
+
+Key derivation:
+    key = SHA-256("evilquest-game-v1:" + nonce_8bytes + auth_token_utf8)
+
+Nonce source: LOGIN_OK message vals[5:9] — four uint16 values packed big-endian into
+8 bytes.
+
+IV construction:
+    iv = nonce[0:8]
+    iv[7] ^= 60    # server->client
+    iv[7] ^= 195   # client->server
+    iv[8:12] = counter as uint32 BE
+
+Frame format:
+    [0xFF] [counter: 4 bytes BE] [AES-GCM ciphertext + 16-byte tag]
+
+These functions are implemented in ws_transport.py as derive_key(), build_nonce(),
+encrypt_game_frame(), and decrypt_game_frame().
+
+
+5. Cipher Activation in Bot (bot.py)
+--------------------------------------
+When LOGIN_OK arrives, the bot now extracts the nonce, derives the key, and activates
+the cipher on the WebSocket:
+
+    if op == S.LOGIN_OK:
+        if len(vals) >= 9 and self.ws is not None and not self.ws.cipher_active:
+            nonce = build_nonce(vals[5:9])
+            key   = derive_key(self._token, nonce)
+            self.ws.set_cipher(key, nonce)
+
+After this point, ws.send() automatically encrypts all outgoing frames and ws.recv()
+automatically decrypts all incoming frames.
+
+
+6. Pathfinder — Local Asset Loading (pathfinder.py)
+-----------------------------------------------------
+Problem: pathfinder.py originally fetched walls.json and tile chunks directly from the
+game server over HTTP, which returned 401 (no auth on those endpoints).
+
+Fix: All map data is now loaded from local files in gameassets/maps/kcmap/ — downloaded
+once during asset scraping (589 files, 60.7MB total).
+
+    _GAMEASSETS = Path(__file__).parent / "gameassets" / "maps" / MAP_ID
+    _WALLS_PATH = _GAMEASSETS / "walls.json"
+    _TILES_DIR  = _GAMEASSETS / "tiles"
+
+load_walls() and load_tiles() read from these paths instead of making HTTP requests.
+
+
+7. Pathfinder — Diagonal Blocking Fix (pathfinder.py)
+------------------------------------------------------
+Problem: A* could path diagonally through blocked tiles (water, walls) on spawn/respawn
+when the player was standing on a server-placed position that was itself inside a blocked
+tile.
+
+Fix: The diagonal corner check is skipped when the player is currently standing on a
+blocked tile:
+
+    if dx != 0 and dz != 0 and not _is_tile_blocked(cx, cz):
+        if _is_tile_blocked(cx + dx, cz) or _is_tile_blocked(cx, cz + dz):
+            continue
+
+
+8. Pathfinder — _nearest_walkable_adjacent Fix (pathfinder.py)
+---------------------------------------------------------------
+Problem: When pathing to an object (e.g. a tree), the destination tile has all 4 walls
+set (bitmask=15). The function finding the nearest adjacent tile was checking
+_is_wall_blocked(goal, neighbor) — which always returned True since the goal tile is
+fully walled, meaning no adjacent tile was ever found and paths to trees returned 0
+waypoints.
+
+Fix: Removed the wall check entirely. The player only needs to stand next to the object,
+not enter its tile, so only the neighbor tile's own walkability matters:
+
+    for dx, dz in [...]:
+        nx, nz = gx + dx, gz + dz
+        if _in_bounds(nx, nz) and not _is_tile_fully_walled(nx, nz):
+            return nx, nz
+
+
+9. Dependencies
+---------------
+    Removed         Added
+    -------         -----
+    aiohttp         requests
+    websockets      cryptography
+    multidict       Pillow
+    yarl            (raw http.client -- stdlib)

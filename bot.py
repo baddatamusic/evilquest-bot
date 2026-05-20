@@ -26,13 +26,13 @@ Usage:
 import asyncio
 import argparse
 import logging
+import os
 import random
-import uuid
 
-import aiohttp
-import websockets
+import requests
 
 from protocol import C, S, SERVER_NAMES, pack, pack_str, unpack, try_unpack_str
+from ws_transport import GameWebSocket, derive_key, build_nonce
 import pathfinder
 
 logging.basicConfig(
@@ -159,24 +159,29 @@ class Bot:
         self.cow_x       = cow_x
         self.cow_y       = cow_y
         self.state       = State()
-        self.ws          = None
+        self.ws: GameWebSocket | None = None
+        self._token: str = ""
         self._sell_lock  = asyncio.Lock()
+
+        self._trunc_at: tuple[int, int] | None = None
+        self._trunc_count: int = 0
+        self.ev_path_truncated = asyncio.Event()
 
     # ── Network ──────────────────────────────────────────────────────────────
 
-    async def _http_login(self) -> str:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                f"{BASE_URL}/api/login",
-                json={"username": self.username,
-                      "password": self.password,
-                      "deviceId": str(uuid.uuid4())},
-            ) as resp:
-                data = await resp.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"Login failed: {data.get('error', data)}")
+    def _http_login_sync(self) -> str:
+        resp = requests.post(
+            f"{BASE_URL}/api/login",
+            json={"username": self.username, "password": self.password},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("token")
+        if not token:
+            raise RuntimeError(f"Login failed: {data}")
         log.info("HTTP login OK")
-        return data["token"]
+        return token
 
     async def _send(self, data: bytes):
         await self.ws.send(data)
@@ -191,6 +196,12 @@ class Bot:
                 self.state.own_entity_id = vals[0]
                 if len(vals) >= 3:
                     self.state.x, self.state.y = vals[1], vals[2]
+            # Derive session cipher key from nonce in vals[5:9]
+            if len(vals) >= 9 and self.ws is not None and not self.ws.cipher_active:
+                nonce = build_nonce(vals[5:9])
+                key   = derive_key(self._token, nonce)
+                self.ws.set_cipher(key, nonce)
+                log.info(f"Cipher active — nonce={nonce.hex()}")
             log.info(f"LOGIN_OK entity_id={self.state.own_entity_id} pos=({self.state.x},{self.state.y})")
             self.state.ev_login_ok.set()
 
@@ -305,7 +316,15 @@ class Bot:
 
         elif op == S.PATH_TRUNCATED:
             if len(vals) >= 2:
+                self.state.x, self.state.y = vals[0], vals[1]
                 log.info(f"PATH_TRUNCATED at ({vals[0]},{vals[1]})")
+                pos = (vals[0], vals[1])
+                if self._trunc_at == pos:
+                    self._trunc_count += 1
+                else:
+                    self._trunc_at = pos
+                    self._trunc_count = 1
+                self.ev_path_truncated.set()
 
         elif op == S.XP_GAIN:
             log.info(f"XP_GAIN skill={vals[0] if vals else '?'} xp={vals[1] if len(vals)>1 else '?'}")
@@ -336,13 +355,22 @@ class Bot:
                     log.debug(f"{label}: vals={vals}")
 
     async def _recv_loop(self):
-        async for msg in self.ws:
-            if isinstance(msg, bytes):
-                self._dispatch(msg)
-                if self.state._pending_map_ready:
-                    self.state._pending_map_ready = False
-                    await self.ws.send(pack(C.MAP_READY))
-                    log.info("MAP_READY sent")
+        while True:
+            try:
+                data = await self.ws.recv()
+            except ConnectionError as exc:
+                log.error(f"WebSocket closed: {exc}")
+                break
+            except Exception as exc:
+                log.error(f"recv error: {exc}")
+                break
+            if data is None:
+                continue
+            self._dispatch(data)
+            if self.state._pending_map_ready:
+                self.state._pending_map_ready = False
+                await self.ws.send(pack(C.MAP_READY))
+                log.info("MAP_READY sent")
 
     # ── Movement ─────────────────────────────────────────────────────────────
 
@@ -362,21 +390,49 @@ class Bot:
             timeout = max(15.0, dist * 0.3)
 
         log.info(f"Moving to ({x},{y}), currently at ({self.state.x},{self.state.y})")
+        self.ev_path_truncated.clear()
         await self._send(self._build_move_packet(x, y))
 
-        deadline          = asyncio.get_event_loop().time() + timeout
-        pos_at_last_send  = (self.state.x, self.state.y)
-        last_resend       = asyncio.get_event_loop().time()
+        deadline         = asyncio.get_event_loop().time() + timeout
+        pos_at_last_send = (self.state.x, self.state.y)
+        last_resend      = asyncio.get_event_loop().time()
 
         while asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(0.5)
+            # Wait up to 2 s for either normal position polling or a PATH_TRUNCATED event.
+            try:
+                await asyncio.wait_for(self.ev_path_truncated.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+            self.ev_path_truncated.clear()
+
             cx, cy = self.state.x, self.state.y
             if abs(cx - x) <= ARRIVE_WINDOW and abs(cy - y) <= ARRIVE_WINDOW:
                 log.info(f"Arrived at ({cx},{cy})")
                 return
-            # Only re-send when position has actually updated — re-sending a path computed from
-            # a stale start position makes the server walk the player in the wrong direction.
-            if asyncio.get_event_loop().time() - last_resend > 12.0:
+
+            now = asyncio.get_event_loop().time()
+
+            # PATH_TRUNCATED logic: on the second truncation at the same spot, block the tile
+            # our pathfinder was trying to route through and re-pathfind around it.
+            if self._trunc_at == (cx, cy) and self._trunc_count >= 2:
+                fresh = pathfinder.find_path(cx, cy, x, y)
+                if fresh:
+                    bx10, bz10 = fresh[0]
+                    btx, btz = bx10 // 10, bz10 // 10
+                    log.info(f"Dynamic block tile ({btx},{btz}) — repeated PATH_TRUNCATED at ({cx},{cy})")
+                    pathfinder.add_dynamic_block(btx, btz)
+                self._trunc_count = 0
+                self._trunc_at    = None
+                await self._send(self._build_move_packet(x, y))
+                pos_at_last_send = (cx, cy)
+                last_resend      = now
+            elif self._trunc_at == (cx, cy) and self._trunc_count == 1:
+                # First truncation — resend immediately from new position.
+                await self._send(self._build_move_packet(x, y))
+                pos_at_last_send = (cx, cy)
+                last_resend      = now
+            elif now - last_resend > 12.0:
+                # Periodic resend only when we've actually moved since last send.
                 if (cx, cy) != pos_at_last_send:
                     remaining = pathfinder.find_path(cx, cy, x, y)
                     if remaining:
@@ -388,7 +444,7 @@ class Bot:
                     else:
                         await self._send(pack(C.PLAYER_MOVE, 1, x, y))
                     pos_at_last_send = (cx, cy)
-                last_resend = asyncio.get_event_loop().time()
+                last_resend = now
 
         log.warning(f"Move timed out at ({self.state.x},{self.state.y}), wanted ({x},{y})")
 
@@ -588,72 +644,83 @@ class Bot:
     # ── Entry points ─────────────────────────────────────────────────────────
 
     async def run(self, mode: str = "woodcutting"):
-        import os
-        walls_path = os.path.join(os.path.dirname(__file__), "walls.json")
-        pathfinder.load_walls(walls_path if os.path.exists(walls_path) else None)
+        pathfinder.load_walls()
         pathfinder.load_tiles()
         log.info(f"Pathfinder ready — {len(pathfinder._walls)} walls, "
                  f"{len(pathfinder._blocked_tiles)} blocked tiles loaded")
-        token  = await self._http_login()
-        ws_url = f"{WS_URL}?token={token}"
 
-        async with websockets.connect(ws_url) as ws:
-            self.ws = ws
-            log.info("WebSocket connected")
+        loop = asyncio.get_running_loop()
+        self._token = await loop.run_in_executor(None, self._http_login_sync)
 
-            await ws.send(pack_str(C.LOGIN, token))
-            log.info("LOGIN sent")
+        ws = GameWebSocket()
+        await ws.connect(self._token)
+        self.ws = ws
+        log.info("WebSocket connected")
 
-            recv      = asyncio.create_task(self._recv_loop())
-            heartbeat = asyncio.create_task(self._heartbeat_loop())
+        recv      = asyncio.create_task(self._recv_loop())
+        heartbeat = asyncio.create_task(self._heartbeat_loop())
 
+        try:
+            await asyncio.wait_for(self.state.ev_login_ok.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            raise RuntimeError("No LOGIN_OK within 10 s")
+
+        await asyncio.sleep(random.uniform(3.0, 5.0))
+        log.info(
+            f"Ready — mode={mode} pos=({self.state.x},{self.state.y}) "
+            f"trees={len(self.state.nearby_trees())} npcs={len(self.state.npcs)}"
+        )
+
+        if mode == "woodcutting":
+            watchdog = asyncio.create_task(self._inventory_watchdog())
             try:
-                await asyncio.wait_for(self.state.ev_login_ok.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                raise RuntimeError("No LOGIN_OK within 10 s")
+                await self._woodcutting_loop()
+            finally:
+                recv.cancel()
+                watchdog.cancel()
+                heartbeat.cancel()
+        else:
+            try:
+                await self._combat_loop()
+            finally:
+                recv.cancel()
+                heartbeat.cancel()
 
-            await asyncio.sleep(random.uniform(5.0, 8.0))
-            log.info(
-                f"Ready — mode={mode} pos=({self.state.x},{self.state.y}) "
-                f"trees={len(self.state.nearby_trees())} npcs={len(self.state.npcs)}"
-            )
-
-            if mode == "woodcutting":
-                watchdog = asyncio.create_task(self._inventory_watchdog())
-                try:
-                    await self._woodcutting_loop()
-                finally:
-                    recv.cancel()
-                    watchdog.cancel()
-                    heartbeat.cancel()
-            else:
-                try:
-                    await self._combat_loop()
-                finally:
-                    recv.cancel()
-                    heartbeat.cancel()
+        await ws.close()
 
     async def sniff(self):
-        token  = await self._http_login()
-        ws_url = f"{WS_URL}?token={token}"
+        loop = asyncio.get_running_loop()
+        self._token = await loop.run_in_executor(None, self._http_login_sync)
 
-        async with websockets.connect(ws_url) as ws:
-            self.ws = ws
-            log.info("SNIFF MODE — go play the game now. Press Ctrl+C to stop.")
-            await ws.send(pack_str(C.LOGIN, token))
+        ws = GameWebSocket()
+        await ws.connect(self._token)
+        self.ws = ws
+        log.info("SNIFF MODE — go play the game now. Press Ctrl+C to stop.")
 
-            async for msg in ws:
-                if not isinstance(msg, bytes):
-                    continue
-                op, vals = unpack(msg)
-                name   = SERVER_NAMES.get(op, f"op_{op}")
-                parsed = try_unpack_str(msg)
-                if parsed and not all(32 <= ord(c) < 127 or c == '\x00' for c in parsed[0]):
-                    print(f"  {name:20s} vals={vals}")
-                elif parsed and parsed[0]:
-                    print(f"  {name:20s} str={parsed[0]!r:30s} vals={parsed[1]}")
-                else:
-                    print(f"  {name:20s} vals={vals}")
+        while True:
+            try:
+                data = await ws.recv()
+            except ConnectionError:
+                break
+            if data is None:
+                continue
+
+            # Set cipher on LOGIN_OK so we see decrypted sniff traffic
+            op, vals = unpack(data)
+            if op == S.LOGIN_OK and len(vals) >= 9 and not ws.cipher_active:
+                nonce = build_nonce(vals[5:9])
+                key   = derive_key(self._token, nonce)
+                ws.set_cipher(key, nonce)
+                log.info("Cipher active (sniff)")
+
+            name   = SERVER_NAMES.get(op, f"op_{op}")
+            parsed = try_unpack_str(data)
+            if parsed and not all(32 <= ord(c) < 127 or c == '\x00' for c in parsed[0]):
+                print(f"  {name:20s} vals={vals}")
+            elif parsed and parsed[0]:
+                print(f"  {name:20s} str={parsed[0]!r:30s} vals={parsed[1]}")
+            else:
+                print(f"  {name:20s} vals={vals}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
