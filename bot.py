@@ -28,6 +28,29 @@ import argparse
 import logging
 import os
 import random
+from pathlib import Path
+
+
+def _load_dotenv() -> None:
+    """Load key=value pairs from .env (same dir as bot.py) into os.environ.
+    Only sets variables that are not already set — CLI / shell env always wins.
+    """
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_dotenv()
 
 from protocol import C, S, SERVER_NAMES, pack, pack_str, unpack, try_unpack_str
 from ws_transport import GameWebSocket, http_login
@@ -94,6 +117,8 @@ class State:
         self.dead_npcs: set[int] = set()
 
         self._pending_map_ready = False
+        self.trunc_x: int = 0   # last PATH_TRUNCATED tile (x10)
+        self.trunc_y: int = 0
 
         self.ev_login_ok         = asyncio.Event()
         self.ev_skilling_start   = asyncio.Event()
@@ -160,8 +185,6 @@ class Bot:
         self._device_cookie:  str = ""
         self._sell_lock  = asyncio.Lock()
 
-        self._trunc_at: tuple[int, int] | None = None
-        self._trunc_count: int = 0
         self.ev_path_truncated = asyncio.Event()
 
     # ── Network ──────────────────────────────────────────────────────────────
@@ -306,14 +329,12 @@ class Bot:
 
         elif op == S.PATH_TRUNCATED:
             if len(vals) >= 2:
-                self.state.x, self.state.y = vals[0], vals[1]
+                # vals[0,1] = the tile where the server truncated the path (x10 coords).
+                # This is where the player will STOP, not where they currently ARE.
+                # Do NOT update state.x/y here — the player is still walking there.
+                self.state.trunc_x = vals[0]
+                self.state.trunc_y = vals[1]
                 log.info(f"PATH_TRUNCATED at ({vals[0]},{vals[1]})")
-                pos = (vals[0], vals[1])
-                if self._trunc_at == pos:
-                    self._trunc_count += 1
-                else:
-                    self._trunc_at = pos
-                    self._trunc_count = 1
                 self.ev_path_truncated.set()
 
         elif op == S.XP_GAIN:
@@ -378,85 +399,166 @@ class Bot:
         """
         Move to (x, y) in x10 coordinates.
 
-        The server never sends position updates during normal movement — the JS client
+        The server never sends position updates during normal walking — the JS client
         uses client-side prediction (moveSpeed=1.67 tiles/sec).  We mirror that here:
-        estimate travel time from path length, sleep, then assume arrival.
 
-        If the server sends PATH_TRUNCATED the position IS updated and we re-path.
-        If the server sends PLAYER_SELF_SYNC (rare correction) the position is updated too.
+        • Send PLAYER_MOVE with up to 50 A*-planned waypoints.
+        • Sleep for estimated travel time (path_steps / 1.67 s).
+        • If PATH_TRUNCATED fires: the server will walk the player to the truncated
+          tile and stop.  Wait for the player to REACH that tile (based on distance
+          from current position / walk speed), then re-path to the destination.
+        • On repeated truncation at the same tile, identify the *next tile in the
+          original sent path after the truncation point* and add it as a dynamic
+          block so A* routes around it on the next attempt.  The dynamic block set
+          is persisted to disk so it survives restarts.
+        • On timeout, update state.x/y to cur_x/cur_y (last confirmed position
+          from PATH_TRUNCATED feedback) rather than assuming the destination.
         """
         if abs(self.state.x - x) <= ARRIVE_WINDOW and abs(self.state.y - y) <= ARRIVE_WINDOW:
             return
 
         log.info(f"Moving to ({x},{y}), currently at ({self.state.x},{self.state.y})")
         self.ev_path_truncated.clear()
-        self._trunc_at    = None
-        self._trunc_count = 0
 
-        async def _send_path_from(sx: int, sz: int) -> int:
-            """Send a move packet from (sx,sz) to (x,y). Returns waypoint count."""
+        loop = asyncio.get_event_loop()
+        _last_path_sent: list[tuple[int, int]] = []   # waypoints sent in last PLAYER_MOVE
+
+        async def _send_path_from(sx: int, sz: int) -> tuple[int, float]:
+            """Send a PLAYER_MOVE from (sx,sz) → (x,y). Returns (steps, travel_sec)."""
+            nonlocal _last_path_sent
             path = pathfinder.find_path(sx, sz, x, y)
             if path:
                 chunk = path[:50]
+                _last_path_sent = list(chunk)
                 args  = [len(chunk)]
                 for wx, wz in chunk:
                     args.extend([wx, wz])
                 await self._send(pack(C.PLAYER_MOVE, *args))
-                return len(chunk)
+                steps = len(chunk)
             else:
+                _last_path_sent = []
                 await self._send(pack(C.PLAYER_MOVE, 1, x, y))
-                return max(1, (abs(sx - x) + abs(sz - y)) // 10)
+                steps = max(1, (abs(sx - x) + abs(sz - y)) // 10)
+            return steps, steps / WALK_TILES_PER_SEC
 
-        n_steps    = await _send_path_from(self.state.x, self.state.y)
-        travel_sec = n_steps / WALK_TILES_PER_SEC
+        # Track where the player actually is (server-confirmed or assumed)
+        cur_x, cur_y = self.state.x, self.state.y
+
+        n_steps, travel_sec = await _send_path_from(cur_x, cur_y)
+        t_send    = loop.time()
+        t_arrive  = t_send + travel_sec
 
         if timeout is None:
-            timeout = max(15.0, travel_sec * 2.5)
+            timeout = max(20.0, travel_sec * 3.0)
+        deadline = t_send + timeout
 
-        loop    = asyncio.get_event_loop()
-        deadline = loop.time() + timeout
-        elapsed  = 0.0
+        dynamic_blocks = 0  # consecutive truncations at same tile
 
-        # Sleep through estimated travel time, waking early on PATH_TRUNCATED
-        while elapsed < travel_sec and loop.time() < deadline:
-            remaining = travel_sec - elapsed
+        while loop.time() < deadline:
+            remaining = t_arrive - loop.time()
+            if remaining <= 0:
+                break   # estimated travel time elapsed → assume arrived
+
             try:
-                await asyncio.wait_for(self.ev_path_truncated.wait(), timeout=min(1.0, remaining))
+                await asyncio.wait_for(self.ev_path_truncated.wait(),
+                                       timeout=min(1.0, remaining))
                 self.ev_path_truncated.clear()
             except asyncio.TimeoutError:
-                elapsed += 1.0
                 continue
 
-            # PATH_TRUNCATED: server gave us our actual position — re-path from there
-            cx, cy = self.state.x, self.state.y
+            # PATH_TRUNCATED: server reports the tile where the player will stop.
+            # Two cases:
+            #   ON-PATH  — the tile is in our last sent path; the player is walking
+            #              there and we must wait for them to arrive.
+            #   OFF-PATH — the server is correcting our position (player was never at
+            #              cur_x/cur_y, or ended up elsewhere due to a prior move).
+            #              Update state immediately; no wait needed.
+            tx, ty = self.state.trunc_x, self.state.trunc_y
 
-            if abs(cx - x) <= ARRIVE_WINDOW and abs(cy - y) <= ARRIVE_WINDOW:
-                log.info(f"Arrived at ({cx},{cy}) (PATH_TRUNCATED near destination)")
-                return
+            # Immediately sync state.x/y to server-confirmed position.
+            self.state.x, self.state.y = tx, ty
 
-            if self._trunc_count >= 2:
-                fresh = pathfinder.find_path(cx, cy, x, y)
-                if fresh:
-                    bx10, bz10 = fresh[0]
-                    btx, btz   = bx10 // 10, bz10 // 10
-                    log.info(f"Dynamic block ({btx},{btz}) — repeated PATH_TRUNCATED at ({cx},{cy})")
-                    pathfinder.add_dynamic_block(btx, btz)
-                self._trunc_count = 0
-                self._trunc_at    = None
+            if abs(tx - x) <= ARRIVE_WINDOW and abs(ty - y) <= ARRIVE_WINDOW:
+                cur_x, cur_y = tx, ty
+                log.info(f"PATH_TRUNCATED near destination ({tx},{ty})")
+                break
 
-            log.info(f"PATH_TRUNCATED, re-pathing from ({cx},{cy})")
-            n_steps    = await _send_path_from(cx, cy)
-            travel_sec = n_steps / WALK_TILES_PER_SEC
-            elapsed    = 0.0
+            # Is the truncation tile on the path we sent?
+            trunc_tile_x = tx // 10
+            trunc_tile_z = ty // 10
+            in_path = any(p[0] // 10 == trunc_tile_x and p[1] // 10 == trunc_tile_z
+                          for p in _last_path_sent)
 
-        # Check if a PLAYER_SELF_SYNC already moved us there
+            if in_path:
+                # Player is walking toward T — wait for them to arrive.
+                trunc_dist_tiles = (abs(cur_x - tx) + abs(cur_y - ty)) / 10.0
+                t_reach_trunc    = t_send + trunc_dist_tiles / WALK_TILES_PER_SEC
+                wait_for = t_reach_trunc - loop.time()
+                if wait_for > 0:
+                    log.info(f"PATH_TRUNCATED at ({tx},{ty}), waiting {wait_for:.1f}s for player to arrive")
+                    await asyncio.sleep(wait_for)
+            else:
+                # Player was not where we thought — server is correcting our position.
+                log.info(f"PATH_TRUNCATED at ({tx},{ty}) (position correction, no wait)")
+
+            cur_x, cur_y = tx, ty
+
+            if abs(cur_x - x) <= ARRIVE_WINDOW and abs(cur_y - y) <= ARRIVE_WINDOW:
+                break
+
+            # Block a tile when the same truncation fires repeatedly.
+            # The correct tile to block is the *next waypoint in the path we sent*
+            # immediately after the truncation tile — that is the step the server
+            # refused to allow.  Fall back to blocking the first step of a fresh
+            # path when the truncation tile wasn't in the sent path (i.e. the entire
+            # path was rejected before the player moved at all).
+            if self.state.trunc_x == tx and self.state.trunc_y == ty:
+                dynamic_blocks += 1
+                if dynamic_blocks >= 2:
+                    trunc_tile_x = tx // 10
+                    trunc_tile_z = ty // 10
+                    blocked_tile: tuple[int, int] | None = None
+
+                    # Search the last sent path for the truncation tile.
+                    for i, (px, pz) in enumerate(_last_path_sent):
+                        if px // 10 == trunc_tile_x and pz // 10 == trunc_tile_z:
+                            if i + 1 < len(_last_path_sent):
+                                blocked_tile = (_last_path_sent[i + 1][0] // 10,
+                                                _last_path_sent[i + 1][1] // 10)
+                            break
+
+                    if blocked_tile is None:
+                        # Truncation was at the start / not in path → block first step.
+                        fresh = pathfinder.find_path(cur_x, cur_y, x, y)
+                        if fresh:
+                            blocked_tile = (fresh[0][0] // 10, fresh[0][1] // 10)
+
+                    if blocked_tile:
+                        log.info(f"Dynamic block {blocked_tile} — repeated truncation at ({tx},{ty})")
+                        pathfinder.add_dynamic_block(*blocked_tile)
+                    dynamic_blocks = 0
+            else:
+                dynamic_blocks = 0
+
+            log.info(f"Re-pathing from ({cur_x},{cur_y}) to ({x},{y})")
+            n_steps, travel_sec = await _send_path_from(cur_x, cur_y)
+            t_send   = loop.time()
+            t_arrive = t_send + travel_sec
+
+        # Update state to reflect where the player ended up.
+        # Prefer server-confirmed position (PLAYER_SELF_SYNC may have updated state.x/y).
         cx, cy = self.state.x, self.state.y
         if abs(cx - x) <= ARRIVE_WINDOW and abs(cy - y) <= ARRIVE_WINDOW:
             log.info(f"Arrived at ({cx},{cy}) (server confirmed)")
+        elif abs(cur_x - x) <= ARRIVE_WINDOW and abs(cur_y - y) <= ARRIVE_WINDOW:
+            log.info(f"Arrived at ({cur_x},{cur_y}) (truncation path complete)")
+            self.state.x, self.state.y = cur_x, cur_y
         else:
-            # Client-side prediction: assume we reached the destination
-            log.info(f"Movement done ({n_steps} steps ≈ {travel_sec:.1f}s), assuming at ({x},{y})")
-            self.state.x, self.state.y = x, y
+            # Use cur_x/cur_y — the last position confirmed via PATH_TRUNCATED.
+            # Do NOT assume destination arrival; the player may not have moved far.
+            steps_walked = max(1, (abs(self.state.x - cur_x) + abs(self.state.y - cur_y)) // 10)
+            log.info(f"Movement done ({steps_walked} steps ≈ {steps_walked / WALK_TILES_PER_SEC:.1f}s), assuming at ({cur_x},{cur_y})")
+            self.state.x, self.state.y = cur_x, cur_y
 
     # ── Woodcutting ───────────────────────────────────────────────────────────
 
@@ -676,8 +778,10 @@ class Bot:
     async def run(self, mode: str = "woodcutting"):
         pathfinder.load_walls()
         pathfinder.load_tiles()
+        pathfinder.load_dynamic_blocks()
         log.info(f"Pathfinder ready — {len(pathfinder._walls)} walls, "
-                 f"{len(pathfinder._blocked_tiles)} blocked tiles loaded")
+                 f"{len(pathfinder._blocked_tiles)} blocked tiles, "
+                 f"{len(pathfinder._dynamic_blocked)} dynamic blocks loaded")
 
         loop = asyncio.get_running_loop()
         self._token, self._device_id, self._device_cookie = await loop.run_in_executor(None, self._http_login_sync)
@@ -763,8 +867,12 @@ def _select_mode_interactive() -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="EvilQuest bot")
-    parser.add_argument("--username",    required=True)
-    parser.add_argument("--password",    required=True)
+    parser.add_argument("--username",
+                        default=os.environ.get("EVILQUEST_USER"),
+                        required=not os.environ.get("EVILQUEST_USER"))
+    parser.add_argument("--password",
+                        default=os.environ.get("EVILQUEST_PASSWORD"),
+                        required=not os.environ.get("EVILQUEST_PASSWORD"))
     parser.add_argument("--mode",        choices=["woodcutting", "combat"],
                         help="Bot mode (skips interactive prompt)")
     parser.add_argument("--tree-entity", type=int, default=DEFAULT_TREE_ENTITY)
