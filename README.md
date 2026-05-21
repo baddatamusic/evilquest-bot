@@ -8,7 +8,7 @@ Fully implements the **evilquest-game-v2** WebSocket protocol including ECDH key
 ## Features
 
 - **Woodcutting mode** — chops trees near the default area, auto-sells logs to Robert when inventory is full (28 logs)
-- **Combat mode** — finds and attacks cows, walks back to the combat area on death
+- **Combat mode** — finds and attacks cows, walks back to the combat area on death; first kill confirmed in **53 s** from spawn
 - **Sniff mode** — passive packet logger; play the game manually while the bot prints every decoded message (useful for reverse engineering)
 - Automatic reconnect-safe login: fetches a server-issued device ID, registers a persistent ECDSA signing key, and negotiates a fresh session on every run
 - A\* pathfinder with wall, water-tile, and **height-based cliff blocking** (pre-computed from terrain height chunks); dynamic tile learning via `PATH_TRUNCATED` catches any missed edges
@@ -66,7 +66,7 @@ On first run the bot generates the signing key and registers it with the server 
 
 | Version | Date | Summary |
 |---|---|---|
-| **3.1** | May 2026 | Height-based cliff pre-computation (≥78 % of cliff tiles blocked at startup); on-path immediate blocking; Euclidean wait-time; `.env` credential loading |
+| **3.1** | May 2026 | Height-based cliff pre-computation (≥78 % of cliff tiles blocked at startup); on-path immediate blocking; Euclidean wait-time; `.env` credential loading — **first kill in 53 s, zero PATH_TRUNCATED events** |
 | **3.0** | May 2026 | Dynamic obstacle persistence; robust `_move()` position tracking; on-path/off-path PATH_TRUNCATED detection; A* tuning |
 | **2.0** | May 2026 | Full evilquest-game-v2 protocol rewrite (ECDH, AES-256-GCM, opcode remapping, signing key) |
 | **1.0** | — | Initial release (v1 protocol, static key, basic woodcutting) |
@@ -78,6 +78,21 @@ On first run the bot generates the signing key and registers it with the server 
 ---
 
 ### v3.1 — Height-based cliff detection + credential management (May 2026)
+
+#### Verified results
+
+Live test, 54-second run from login to first confirmed kill:
+
+```
+08:31:52  Pathfinder ready — 2222 walls, 3710 water tiles, 19595 height tiles, 235 dynamic blocks
+08:31:54  LOGIN_OK entity_id=170 pos=(1115,1825)
+08:31:58  Walking to cow area (1211,1664)
+08:32:24  Arrived at (1215,1665) (server confirmed)   ← zero PATH_TRUNCATED events
+08:32:25  Attacking cow entity=14 at (1205,1695)
+08:32:30  XP_GAIN skill=0 xp=1  …
+08:32:45  Cow 14 defeated                             ← first kill at 53 s
+08:32:45  Attacking cow entity=15 at (1205,1675)      ← immediate retarget
+```
 
 #### Background
 
