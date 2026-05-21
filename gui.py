@@ -1,5 +1,5 @@
 """
-EvilBot V2 by Blackberry — GUI for the EvilQuest automated bot.
+EvilBot V3 by Blackberry — GUI for the EvilQuest automated bot.
 """
 
 import os
@@ -11,8 +11,28 @@ import asyncio
 import threading
 import tkinter as tk
 from tkinter import ttk
+from pathlib import Path
 
 from PIL import Image, ImageTk, ImageDraw, ImageFont
+
+
+# ── Load .env early so login fields can be pre-filled ────────────────────────
+
+def _load_dotenv_early() -> None:
+    env = Path(__file__).parent / ".env"
+    if not env.exists():
+        return
+    with open(env) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k = k.strip()
+            if k and k not in os.environ:
+                os.environ[k] = v.strip()
+
+_load_dotenv_early()
 
 
 # ── Asset resolver (works both in dev and PyInstaller EXE) ───────────────────
@@ -61,7 +81,6 @@ def _load_sprite(filename: str, size: int) -> ImageTk.PhotoImage | None:
     try:
         img = Image.open(_res(f"gameassets/sprites/items/{filename}")).convert("RGBA")
         img = img.resize((size, size), Image.LANCZOS)
-        # Convert RGBA → RGB with dark background for tkinter PhotoImage
         bg  = Image.new("RGB", img.size, (int(C_PANEL[1:3], 16),
                                           int(C_PANEL[3:5], 16),
                                           int(C_PANEL[5:7], 16)))
@@ -119,19 +138,19 @@ SKILL_NAMES = {0: "Attack", 1: "Strength", 2: "Defence",
 class EvilBotApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("EvilBot V2 by Blackberry")
+        self.root.title("EvilBot V3 by Blackberry")
         self.root.configure(bg=C_BG)
         self.root.resizable(False, False)
 
         # Shared state
-        self._log_q:       queue.Queue       = queue.Queue()
-        self._bot_thread:  threading.Thread | None = None
+        self._log_q:       queue.Queue                  = queue.Queue()
+        self._bot_thread:  threading.Thread | None      = None
         self._bot_loop:    asyncio.AbstractEventLoop | None = None
         self._running      = False
         self._username     = ""
         self._password     = ""
         self._mode         = "woodcutting"
-        self._handler:     _QueueHandler | None = None
+        self._handler:     _QueueHandler | None         = None
 
         # Live stats (updated by parsing log lines)
         self._kills   = 0
@@ -196,7 +215,7 @@ class EvilBotApp:
 
         # Title
         canvas.create_text(cx, cy - ch // 2 + 80,
-                            text="EvilBot V2",
+                            text="EvilBot V3",
                             font=("Segoe UI", 26, "bold"),
                             fill=C_GOLD)
         canvas.create_text(cx, cy - ch // 2 + 108,
@@ -283,6 +302,17 @@ class EvilBotApp:
         self._uent.focus()
         self._canvas_login = canvas
 
+        # Pre-fill credentials from .env / environment if available
+        env_user = os.environ.get("EVILQUEST_USER", "")
+        env_pass = os.environ.get("EVILQUEST_PASSWORD", "")
+        if env_user:
+            self._uvar.set(env_user)
+        if env_pass:
+            self._pvar.set(env_pass)
+        # If both are pre-filled, move focus to the mode selector
+        if env_user and env_pass:
+            mode_combo.focus()
+
     def _on_login(self):
         u = self._uvar.get().strip()
         p = self._pvar.get().strip()
@@ -319,7 +349,7 @@ class EvilBotApp:
             tk.Label(hdr, image=spr, bg=C_HEADER).pack(side="left", padx=(10, 4), pady=6)
 
         # Title
-        tk.Label(hdr, text="EvilBot V2",
+        tk.Label(hdr, text="EvilBot V3",
                  font=("Segoe UI", 13, "bold"),
                  bg=C_HEADER, fg=C_GOLD).pack(side="left", padx=(0, 6))
 
@@ -394,14 +424,27 @@ class EvilBotApp:
                  font=("Segoe UI", 8), bg=C_PANEL, fg=C_DIM).pack(anchor="w", padx=12)
 
         self._xp_labels: dict[int, tk.StringVar] = {}
-        skills = ([0, 1, 2, 6] if self._mode == "combat"
-                  else [7, 6])
+        skills = ([0, 1, 2, 6] if self._mode == "combat" else [7, 6])
         for sk in skills:
             var = tk.StringVar(value=f"{SKILL_NAMES[sk]}: 0")
             self._xp_labels[sk] = var
             tk.Label(sidebar, textvariable=var,
                      font=("Consolas", 9), bg=C_PANEL, fg=C_CYAN,
                      anchor="w").pack(fill="x", padx=12)
+
+        # Dynamic blocks counter (v3.1 — shows how many cliff tiles are known)
+        tk.Frame(sidebar, bg=C_BORDER, height=1).pack(fill="x", padx=8, pady=4)
+        tk.Label(sidebar, text="Map Learning",
+                 font=("Segoe UI", 8), bg=C_PANEL, fg=C_DIM).pack(anchor="w", padx=12)
+        self._blocks_var = tk.StringVar(value="Cliff blocks: —")
+        tk.Label(sidebar, textvariable=self._blocks_var,
+                 font=("Consolas", 9), bg=C_PANEL, fg=C_PURPLE,
+                 anchor="w").pack(fill="x", padx=12)
+        self._trunc_var = tk.StringVar(value="Truncations: 0")
+        tk.Label(sidebar, textvariable=self._trunc_var,
+                 font=("Consolas", 9), bg=C_PANEL, fg=C_YELLOW,
+                 anchor="w").pack(fill="x", padx=12)
+        self._truncations = 0
 
         # Mode sprite at bottom of sidebar
         spr2 = _load_sprite(sprite_file, 48)
@@ -438,6 +481,7 @@ class EvilBotApp:
         self._log_box.tag_configure("XP",      foreground=C_CYAN)
         self._log_box.tag_configure("LEVELUP", foreground=C_GOLD2)
         self._log_box.tag_configure("KILL",    foreground=C_GREEN)
+        self._log_box.tag_configure("ATTACK",  foreground=C_ORANGE)
         self._log_box.tag_configure("CHOP",    foreground=C_GREEN)
         self._log_box.tag_configure("DEATH",   foreground=C_RED)
         self._log_box.tag_configure("MOVE",    foreground="#606080")
@@ -445,6 +489,7 @@ class EvilBotApp:
         self._log_box.tag_configure("BLOCK",   foreground=C_PURPLE)
         self._log_box.tag_configure("READY",   foreground=C_GOLD)
         self._log_box.tag_configure("CONN",    foreground=C_GREEN)
+        self._log_box.tag_configure("HEIGHT",  foreground="#7048a8")
 
         # ── Status bar ────────────────────────────────────────────────────────
         sbar = tk.Frame(self.root, bg=C_HEADER, pady=3)
@@ -453,7 +498,7 @@ class EvilBotApp:
         tk.Label(sbar, textvariable=self._status_var,
                  font=("Segoe UI", 8), bg=C_HEADER, fg=C_DIM,
                  anchor="w").pack(side="left", padx=10)
-        tk.Label(sbar, text="EvilBot V2 by Blackberry",
+        tk.Label(sbar, text="EvilBot V3 by Blackberry",
                  font=("Segoe UI", 8), bg=C_HEADER, fg=C_DIM,
                  anchor="e").pack(side="right", padx=10)
 
@@ -463,25 +508,34 @@ class EvilBotApp:
 
     def _tag_for(self, line: str) -> str:
         lo = line.lower()
-        if "level_up"         in lo: return "LEVELUP"
-        if "xp_gain"          in lo: return "XP"
-        if "defeated"         in lo: return "KILL"
-        if "skilling_stop"    in lo: return "CHOP"
-        if "died"             in lo: return "DEATH"
-        if "entity_death"     in lo: return "DEATH"
-        if "respawned"        in lo: return "DEATH"
-        if "cipher active"    in lo: return "CIPHER"
-        if "ready"            in lo: return "READY"
-        if "websocket"        in lo: return "CONN"
-        if "login_ok"         in lo: return "CONN"
-        if "map_change"       in lo: return "CONN"
-        if "dynamic block"    in lo: return "BLOCK"
-        if "path_truncated"   in lo: return "PATH"
-        if "moving to"        in lo: return "MOVE"
-        if "walking"          in lo: return "MOVE"
-        if "arrived"          in lo: return "MOVE"
-        if "warning"          in lo: return "WARNING"
-        if "error"            in lo: return "ERROR"
+        if "level_up"            in lo: return "LEVELUP"
+        if "xp_gain"             in lo: return "XP"
+        if "defeated"            in lo: return "KILL"
+        if "attacking cow"       in lo: return "ATTACK"
+        if "skilling_stop"       in lo: return "CHOP"
+        if "died"                in lo: return "DEATH"
+        if "entity_death"        in lo: return "DEATH"
+        if "respawned"           in lo: return "DEATH"
+        if "player died"         in lo: return "DEATH"
+        if "cipher active"       in lo: return "CIPHER"
+        if "pathfinder ready"    in lo: return "READY"
+        if "ready"               in lo: return "READY"
+        if "websocket"           in lo: return "CONN"
+        if "login_ok"            in lo: return "CONN"
+        if "map_change"          in lo: return "CONN"
+        if "http login"          in lo: return "CONN"
+        if "loaded height"       in lo: return "HEIGHT"
+        if "cliff threshold"     in lo: return "HEIGHT"
+        if "dynamic block"       in lo: return "BLOCK"
+        if "blocking"            in lo: return "BLOCK"
+        if "path_truncated"      in lo: return "PATH"
+        if "re-pathing"          in lo: return "PATH"
+        if "moving to"           in lo: return "MOVE"
+        if "walking"             in lo: return "MOVE"
+        if "arrived"             in lo: return "MOVE"
+        if "movement done"       in lo: return "MOVE"
+        if "warning"             in lo: return "WARNING"
+        if "error"               in lo: return "ERROR"
         return "INFO"
 
     def _update_stats(self, line: str):
@@ -509,13 +563,39 @@ class EvilBotApp:
             self._status_var.set(f"Chop #{self._chops} ↑")
             return
 
+        # PATH_TRUNCATED counter
+        if "PATH_TRUNCATED" in line:
+            self._truncations += 1
+            self._trunc_var.set(f"Truncations: {self._truncations}")
+
+        # Dynamic blocks count from "Pathfinder ready" line
+        m2 = re.search(r"(\d+) dynamic blocks", line)
+        if m2:
+            self._blocks_var.set(f"Cliff blocks: {m2.group(1)}")
+
+        # Dynamic block added at runtime
+        if re.search(r"blocking \(", line, re.I) or re.search(r"dynamic block \(", line, re.I):
+            m3 = re.search(r"(\d+) dynamic blocks", line)
+            if not m3:
+                # Increment from current display
+                cur = self._blocks_var.get()
+                n_m = re.search(r"(\d+)", cur)
+                if n_m:
+                    self._blocks_var.set(f"Cliff blocks: {int(n_m.group(1)) + 1}")
+
         # Status line updates
-        if "Moving to" in line:
-            self._status_var.set(line.split("Moving to")[-1].strip()[:60])
-        elif "Attacking" in line:
-            self._status_var.set(line.split("INFO")[-1].strip()[:60])
+        if "Attacking" in line:
+            self._status_var.set(line.split("INFO")[-1].strip()[:70])
+        elif "Moving to" in line:
+            self._status_var.set(line.split("Moving to")[-1].strip()[:70])
         elif "Chopping" in line:
-            self._status_var.set(line.split("INFO")[-1].strip()[:60])
+            self._status_var.set(line.split("INFO")[-1].strip()[:70])
+        elif "Walking to" in line:
+            self._status_var.set(line.split("INFO")[-1].strip()[:70])
+        elif "Arrived" in line:
+            self._status_var.set(line.split("INFO")[-1].strip()[:70])
+        elif "Player died" in line:
+            self._status_var.set("Player died — walking back…")
 
     def _append_log(self, line: str):
         self._update_stats(line)
@@ -539,22 +619,26 @@ class EvilBotApp:
         import bot as bot_mod
         import pathfinder
 
-        # Register log handler once
+        # Attach queue handler to both bot and pathfinder loggers (once)
         if self._handler is None:
             self._handler = _QueueHandler(self._log_q)
-            logging.getLogger("bot").addHandler(self._handler)
-            logging.getLogger("bot").setLevel(logging.DEBUG)
+            for name in ("bot", "pathfinder"):
+                lg = logging.getLogger(name)
+                lg.addHandler(self._handler)
+                lg.setLevel(logging.DEBUG)
 
-        # Reset stats
-        self._kills = 0
-        self._chops = 0
+        # Reset session stats
+        self._kills       = 0
+        self._chops       = 0
+        self._truncations = 0
         self._xp.clear()
-        for var in self._xp_labels.values():
-            sk = next(k for k, v in self._xp_labels.items() if v is var)
+        for sk, var in self._xp_labels.items():
             var.set(f"{SKILL_NAMES.get(sk, sk)}: 0")
         self._stat_action_var.set(
             "Kills: 0" if self._mode == "combat" else "Chops: 0"
         )
+        self._blocks_var.set("Cliff blocks: —")
+        self._trunc_var.set("Truncations: 0")
 
         self._running = True
         self._set_btn_states(running=True)
@@ -563,11 +647,14 @@ class EvilBotApp:
         mode = self._mode
 
         def _thread():
-            # Reset pathfinder for a fresh session
-            pathfinder._loaded        = False
-            pathfinder._tiles_loaded  = False
+            # Full pathfinder reset so a fresh session reloads everything
+            pathfinder._loaded          = False
+            pathfinder._tiles_loaded    = False
+            pathfinder._heights_loaded  = False
             pathfinder._walls.clear()
             pathfinder._blocked_tiles.clear()
+            pathfinder._heights.clear()
+            # Dynamic blocks persist across restarts (intentional — cliff memory)
             pathfinder._dynamic_blocked.clear()
 
             loop = asyncio.new_event_loop()

@@ -1,12 +1,33 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
     ['gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('gameassets\\ui\\stone-dark.png', 'gameassets\\ui'), ('gameassets\\maps\\kcmap\\walls.json', 'gameassets\\maps\\kcmap'), ('gameassets\\maps\\kcmap\\tiles', 'gameassets\\maps\\kcmap\\tiles')],
-    hiddenimports=['cryptography', 'cryptography.hazmat.primitives.ciphers.aead', 'PIL', 'PIL.Image', 'PIL.ImageTk', 'PIL.ImageDraw', 'PIL.ImageFont', 'requests', 'bot', 'pathfinder', 'ws_transport'],
+    datas=[
+        # UI assets
+        ('gameassets\\ui\\stone-dark.png',         'gameassets\\ui'),
+        # Item sprites used in login screen and sidebar
+        ('gameassets\\sprites\\items',              'gameassets\\sprites\\items'),
+        # Map data — walls, water tiles, height chunks
+        ('gameassets\\maps\\kcmap\\walls.json',     'gameassets\\maps\\kcmap'),
+        ('gameassets\\maps\\kcmap\\tiles',          'gameassets\\maps\\kcmap\\tiles'),
+        ('gameassets\\maps\\kcmap\\heights',        'gameassets\\maps\\kcmap\\heights'),
+    ],
+    hiddenimports=[
+        'cryptography',
+        'cryptography.hazmat.primitives.ciphers.aead',
+        'PIL',
+        'PIL.Image',
+        'PIL.ImageTk',
+        'PIL.ImageDraw',
+        'PIL.ImageFont',
+        'requests',
+        'bot',
+        'pathfinder',
+        'ws_transport',
+        'protocol',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +43,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='EvilBot',
+    name='EvilBot-V3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
