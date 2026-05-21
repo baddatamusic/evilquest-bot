@@ -1,0 +1,169 @@
+EvilBot V3 — Change Log
+=======================
+Date: May 2026
+Author: Blackberry
+Version: 3.1
+
+
+OVERVIEW
+--------
+V3 focused entirely on navigation reliability and combat performance.
+The core problem was a large diagonal cliff separating the spawn area from
+the cow combat zone. The server enforces this cliff but it is absent from
+the local walls.json and tile data, meaning the bot had no way to know
+about it in advance. This required building a full obstacle-learning system
+and then optimising it with pre-computed terrain height data.
+
+First confirmed kill time went from "never (bot stuck)" to 53 seconds from
+login with zero PATH_TRUNCATED events on a clean south-of-cliff spawn.
+
+
+---------------------------------------------------------------------------
+V3.0 — Navigation Reliability
+---------------------------------------------------------------------------
+
+DYNAMIC BLOCK PERSISTENCE (pathfinder.py)
+  - Added load_dynamic_blocks(): reads ~/.evilquest/dynamic_blocks.json at
+    startup so cliff tiles learned in previous runs are remembered.
+  - Added _save_dynamic_blocks(): writes the block set to disk after every
+    new discovery. Blocks now accumulate across sessions.
+  - add_dynamic_block() skips the disk write if the tile is already known.
+  - Format: [[tx, tz], ...] sorted list of tile coordinates.
+
+A* MAX_STEPS INCREASE (pathfinder.py)
+  - Default max_steps raised from 500 to 5000 (node budget 2000 → 20000).
+  - The old limit caused find_path() to return [] for legitimate long routes
+    around the cliff, forcing the bot into single-step fallback moves that
+    the server immediately truncated.
+
+_move() POSITION TRACKING OVERHAUL (bot.py)
+  - Bug 1: state.x/state.y were not updated on PATH_TRUNCATED. All
+    subsequent A* calls planned from stale position. Fixed.
+  - Bug 2: Movement timeout assumed the player arrived at destination.
+    Fixed to use cur_x/cur_y (last confirmed position) instead.
+  - Bug 3: Wrong tile was being blocked on repeated truncation — the code
+    blocked the first tile of the new path rather than the tile the server
+    refused to enter. Fixed by tracking _last_path_sent and blocking the
+    tile immediately after the truncation point in the sent path.
+
+ON-PATH vs OFF-PATH PATH_TRUNCATED DETECTION (bot.py)
+  - Server sometimes sends PATH_TRUNCATED at a tile not on the planned path
+    as a position correction. Old code always waited distance/1.67 seconds
+    before re-pathing, causing stalls on off-path corrections.
+  - Fixed: check whether truncation tile appears in _last_path_sent.
+    In-path → wait for player to arrive. Off-path → re-path immediately.
+
+_last_path_sent TRACKING (bot.py)
+  - Added _last_path_sent list populated by _send_path_from().
+  - Stores exact waypoints sent in the last PLAYER_MOVE packet.
+  - Used by both on/off-path detection and correct-tile-to-block logic.
+
+CREDENTIAL MANAGEMENT (.env + bot.py)
+  - Added .env file (git-ignored) with EVILQUEST_USER and EVILQUEST_PASSWORD.
+  - Added _load_dotenv() in bot.py: reads .env into os.environ at startup.
+  - --username and --password CLI flags are now optional when .env is present.
+
+
+---------------------------------------------------------------------------
+V3.1 — Height-Based Cliff Detection
+---------------------------------------------------------------------------
+
+HEIGHT-BASED CLIFF PRE-COMPUTATION (pathfinder.py)
+  - Added load_heights(): reads all 16 gameassets/maps/kcmap/heights/
+    chunk_CX_CZ.json files into a sparse height map at startup.
+    Total coverage: ~19,595 tiles across the full map.
+  - Added HEIGHT_CLIFF_THRESHOLD = 0.7 (game units). Any edge between two
+    adjacent tiles where abs(h_from - h_to) > 0.7 is treated as a cliff
+    and blocked at path-planning time without needing a server round-trip.
+  - _is_wall_blocked() checks height diff before the wall bitmask check.
+  - find_path() auto-calls load_heights() on first invocation.
+  - Empirical calibration against 233 known cliff tiles:
+      threshold 0.75 → 78% of known blocks detected at startup
+      threshold 1.00 → 55% of known blocks detected at startup
+      threshold 0.70 → recovers a few additional edge tiles
+  - Remaining misses (~22%) are still caught by PATH_TRUNCATED learning.
+
+ON-PATH IMMEDIATE BLOCKING (bot.py)
+  - Old behaviour: required 2 PATH_TRUNCATED events at the same tile before
+    blocking. On-path truncations needed an unnecessary second round-trip.
+  - Fixed: on-path truncation immediately calls add_dynamic_block() for the
+    next tile in _last_path_sent after the truncation point. That tile is
+    definitively impassable — no second confirmation needed.
+  - Off-path (position correction) truncations still use the 2-occurrence
+    gate since repeated off-path signals are less certain.
+
+EUCLIDEAN WAIT-TIME CALCULATION (bot.py)
+  - Wait time after PATH_TRUNCATED was using Manhattan distance, which
+    overestimates diagonal paths by up to 41%.
+  - Fixed: trunc_dist_tiles = sqrt((cur_x - tx)^2 + (cur_y - tz)^2) / 10.0
+
+STARTUP LOG (bot.py)
+  - Pathfinder ready line now reports all four data sources:
+    "walls, water tiles, height tiles, dynamic blocks"
+
+
+---------------------------------------------------------------------------
+V3.1 GUI — EvilBot V3 by Blackberry
+---------------------------------------------------------------------------
+
+REBRANDING
+  - Window title, header, login card, and status bar all updated to
+    "EvilBot V3 by Blackberry".
+
+.ENV AUTO-FILL
+  - _load_dotenv_early() runs at GUI startup before the login screen builds.
+  - Username and password fields are pre-populated from EVILQUEST_USER /
+    EVILQUEST_PASSWORD if present. Mode combo box gets focus automatically
+    when both fields are filled.
+
+PATHFINDER LOGGER IN GUI
+  - _QueueHandler now attached to both "bot" and "pathfinder" loggers so
+    height-loading, dynamic-block, and cliff-threshold messages appear in
+    the GUI log box (previously only "bot" logger was wired up).
+
+PATHFINDER RESET ON RESTART
+  - Added _heights_loaded = False and _heights.clear() to the bot thread
+    reset block so height data reloads cleanly on every Start/Restart.
+
+MAP LEARNING SIDEBAR SECTION
+  - New "Map Learning" section in the stats sidebar shows:
+      Cliff blocks: N  — count of dynamic blocks (cliff tiles known)
+      Truncations: N   — number of PATH_TRUNCATED events this session
+
+NEW LOG TAGS
+  - ATTACK (orange)       — "Attacking cow" lines
+  - HEIGHT (muted purple) — height-load and cliff-threshold lines
+  - Extended _tag_for() to cover: HTTP login, pathfinder ready, re-pathing,
+    movement done, blocking, player died, walking to, arrived
+
+STATUS BAR IMPROVEMENTS
+  - Updates on: Attacking / Walking to / Arrived / Player died
+    in addition to the existing Moving to updates
+
+PYINSTALLER SPEC UPDATES (EvilBot.spec)
+  - Added gameassets/sprites/items/ to bundled data (login + sidebar sprites)
+  - Added gameassets/maps/kcmap/heights/ to bundled data (cliff detection)
+  - Added protocol to hiddenimports
+  - Executable renamed from EvilBot.exe to EvilBot-V3.exe
+
+
+---------------------------------------------------------------------------
+VERIFIED TEST RESULTS
+---------------------------------------------------------------------------
+
+60-second test (pre-fix):
+  - Bot spent entire run learning cliff tiles via PATH_TRUNCATED.
+  - Never reached cow area.
+
+60-second test (post height detection):
+  - Reached cow area with zero PATH_TRUNCATED events.
+  - Found cow entity, began walking to attack at second 46.
+
+54-second kill test (final):
+  08:31:52  Pathfinder ready — 19595 height tiles, 235 dynamic blocks
+  08:31:54  LOGIN_OK pos=(1115,1825)
+  08:31:58  Walking to cow area
+  08:32:24  Arrived (zero PATH_TRUNCATED)
+  08:32:25  Attacking cow entity=14
+  08:32:45  Cow 14 defeated          ← first kill at 53 s from login
+  08:32:45  Attacking cow entity=15  ← immediate retarget
