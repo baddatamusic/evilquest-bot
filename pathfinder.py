@@ -16,23 +16,34 @@ Coordinate systems:
 
 import heapq
 import json
+import logging
 import urllib.request
 from pathlib import Path
+
+_log = logging.getLogger("pathfinder")
 
 MAP_ID     = "kcmap"
 MAP_W      = 320
 MAP_H      = 256
 CHUNK_SIZE = 64
 
-_GAMEASSETS = Path(__file__).parent / "gameassets" / "maps" / MAP_ID
-_WALLS_PATH = _GAMEASSETS / "walls.json"
-_TILES_DIR  = _GAMEASSETS / "tiles"
+_GAMEASSETS  = Path(__file__).parent / "gameassets" / "maps" / MAP_ID
+_WALLS_PATH  = _GAMEASSETS / "walls.json"
+_TILES_DIR   = _GAMEASSETS / "tiles"
+_HEIGHTS_DIR = _GAMEASSETS / "heights"
 
 # Wall direction bitmasks
 W_N = 1   # north wall on this tile (blocks moving to tile z-1)
 W_E = 2   # east wall  (blocks moving to tile x+1)
 W_S = 4   # south wall (blocks moving to tile z+1)
 W_W = 8   # west wall  (blocks moving to tile x-1)
+
+# Height difference (game units) above which an edge between two adjacent
+# tiles is considered a cliff and treated as impassable.  Empirical testing
+# against 233 known blocked tiles matched 78 % at 0.75 and 55 % at 1.0,
+# so 0.75 is the sweet spot; use a slightly tighter 0.7 to recover a few
+# more cliff edges.  Dynamic PATH_TRUNCATED learning catches any misses.
+HEIGHT_CLIFF_THRESHOLD = 0.7
 
 _walls: dict[tuple[int,int], int] = {}
 _loaded = False
@@ -41,7 +52,13 @@ _blocked_tiles: set[tuple[int,int]] = set()
 _tiles_loaded = False
 _dynamic_blocked: set[tuple[int,int]] = set()
 
+_heights: dict[tuple[int, int], float] = {}
+_heights_loaded = False
+
 _WATER_PROPS = {"waterSurface", "waterPainted"}
+
+_EVILQUEST_DIR = Path.home() / ".evilquest"
+_BLOCKS_FILE   = _EVILQUEST_DIR / "dynamic_blocks.json"
 
 
 def load_walls(walls_json_path: str | None = None):
@@ -100,6 +117,47 @@ def load_tiles():
     _tiles_loaded = True
 
 
+def load_heights() -> None:
+    """Load per-tile height data from local gameassets height chunks.
+
+    Heights are stored as sparse JSON: {"row,col": float, ...} where
+    row = local_z and col = local_x within a 64×64 chunk.  Tiles absent
+    from the file are treated as height 0.0 (flat ground).
+
+    Once loaded, _is_wall_blocked() uses HEIGHT_CLIFF_THRESHOLD to reject
+    moves across edges where the height difference is too large — this
+    pre-blocks cliff tiles without relying solely on PATH_TRUNCATED learning.
+    """
+    global _heights, _heights_loaded
+    if _heights_loaded:
+        return
+
+    _heights.clear()
+    chunk_files = sorted(_HEIGHTS_DIR.glob("chunk_*.json"))
+    for path in chunk_files:
+        parts = path.stem.split("_")   # ["chunk", cx, cz]
+        if len(parts) != 3:
+            continue
+        cx, cz = int(parts[1]), int(parts[2])
+        base_x = cx * CHUNK_SIZE
+        base_z = cz * CHUNK_SIZE
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            for key, h in data.items():
+                row_str, col_str = key.split(",")
+                local_z, local_x = int(row_str), int(col_str)
+                _heights[(base_x + local_x, base_z + local_z)] = float(h)
+        except Exception as exc:
+            _log.warning(f"Could not load height file {path.name}: {exc}")
+
+    _heights_loaded = True
+    _log.info(
+        f"Loaded height data: {len(_heights)} tiles from {len(chunk_files)} chunks "
+        f"(cliff threshold: {HEIGHT_CLIFF_THRESHOLD} game units)"
+    )
+
+
 def _wall_at(tx: int, tz: int) -> int:
     return _walls.get((tx, tz), 0)
 
@@ -108,13 +166,50 @@ def _is_tile_blocked(tx: int, tz: int) -> bool:
     return (tx, tz) in _blocked_tiles or (tx, tz) in _dynamic_blocked
 
 
+def load_dynamic_blocks() -> None:
+    """Load previously persisted dynamic blocks from disk."""
+    global _dynamic_blocked
+    try:
+        if _BLOCKS_FILE.exists():
+            with open(_BLOCKS_FILE) as f:
+                data = json.load(f)
+            before = len(_dynamic_blocked)
+            for item in data:
+                _dynamic_blocked.add((int(item[0]), int(item[1])))
+            added = len(_dynamic_blocked) - before
+            if added:
+                _log.info(f"Loaded {added} persisted dynamic blocks")
+    except Exception as exc:
+        _log.warning(f"Could not load dynamic blocks: {exc}")
+
+
+def _save_dynamic_blocks() -> None:
+    """Persist the current dynamic block set to disk (called after each new block)."""
+    try:
+        _EVILQUEST_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_BLOCKS_FILE, "w") as f:
+            json.dump(sorted([tx, tz] for tx, tz in _dynamic_blocked), f)
+    except Exception as exc:
+        _log.warning(f"Could not save dynamic blocks: {exc}")
+
+
 def add_dynamic_block(tx: int, tz: int) -> None:
     """Add a tile that the server has rejected at runtime (PATH_TRUNCATED feedback)."""
-    _dynamic_blocked.add((tx, tz))
+    if (tx, tz) not in _dynamic_blocked:
+        _dynamic_blocked.add((tx, tz))
+        _save_dynamic_blocks()
 
 
 def _is_wall_blocked(fx: int, fz: int, tx: int, tz: int) -> bool:
     """Return True if moving from tile (fx,fz) to adjacent tile (tx,tz) is wall-blocked."""
+    # Cliff check: large height difference between adjacent tiles → impassable.
+    # Tiles absent from _heights default to 0.0 (flat terrain).
+    if _heights_loaded:
+        h_from = _heights.get((fx, fz), 0.0)
+        h_to   = _heights.get((tx, tz), 0.0)
+        if abs(h_from - h_to) > HEIGHT_CLIFF_THRESHOLD:
+            return True
+
     dx, dz = tx - fx, tz - fz
 
     def has_wall(cx, cz, bit):
@@ -180,7 +275,7 @@ def _nearest_walkable_adjacent(gx: int, gz: int) -> tuple[int, int] | None:
 
 def find_path(start_x10: int, start_z10: int,
               dest_x10: int, dest_z10: int,
-              max_steps: int = 500) -> list[tuple[int, int]]:
+              max_steps: int = 5000) -> list[tuple[int, int]]:
     """
     A* pathfinding from start to dest.
     Coordinates are x10 (as used in OP_OWN_STATE / PLAYER_MOVE packets).
@@ -190,6 +285,8 @@ def find_path(start_x10: int, start_z10: int,
     """
     if not _loaded:
         load_walls()
+    if not _heights_loaded:
+        load_heights()
 
     sx, sz = start_x10 // 10, start_z10 // 10
     gx, gz = dest_x10 // 10,  dest_z10 // 10

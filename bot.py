@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import argparse
 import logging
+import math
 import os
 import random
 from pathlib import Path
@@ -489,56 +490,58 @@ class Bot:
             in_path = any(p[0] // 10 == trunc_tile_x and p[1] // 10 == trunc_tile_z
                           for p in _last_path_sent)
 
+            # Find the tile immediately after T in the sent path — that is the
+            # step the server refused.  Used for both on-path and off-path cases.
+            _next_blocked: tuple[int, int] | None = None
+            for i, (px, pz) in enumerate(_last_path_sent):
+                if px // 10 == trunc_tile_x and pz // 10 == trunc_tile_z:
+                    if i + 1 < len(_last_path_sent):
+                        _next_blocked = (_last_path_sent[i + 1][0] // 10,
+                                         _last_path_sent[i + 1][1] // 10)
+                    break
+
             if in_path:
-                # Player is walking toward T — wait for them to arrive.
-                trunc_dist_tiles = (abs(cur_x - tx) + abs(cur_y - ty)) / 10.0
+                # ON-PATH: the server is telling us the player will stop at T and
+                # the next step is impassable.  We know this for certain — block it
+                # immediately so the very next re-path already routes around it.
+                if _next_blocked:
+                    log.info(f"PATH_TRUNCATED at ({tx},{ty}) → blocking {_next_blocked}")
+                    pathfinder.add_dynamic_block(*_next_blocked)
+
+                # Wait for the player to walk to T (use Euclidean distance for
+                # accuracy — diagonal steps are faster than Manhattan tiles).
+                trunc_dist_tiles = math.sqrt((cur_x - tx) ** 2 + (cur_y - ty) ** 2) / 10.0
                 t_reach_trunc    = t_send + trunc_dist_tiles / WALK_TILES_PER_SEC
                 wait_for = t_reach_trunc - loop.time()
                 if wait_for > 0:
-                    log.info(f"PATH_TRUNCATED at ({tx},{ty}), waiting {wait_for:.1f}s for player to arrive")
+                    log.info(f"PATH_TRUNCATED at ({tx},{ty}), walking "
+                             f"{trunc_dist_tiles:.1f} tiles ({wait_for:.1f}s)")
                     await asyncio.sleep(wait_for)
+                dynamic_blocks = 0   # on-path blocking handled above
             else:
-                # Player was not where we thought — server is correcting our position.
+                # OFF-PATH: server is correcting our position; T is where the
+                # player actually is.  Block only on repeated truncation at the
+                # same spot (one re-path that lands at T again confirms the block).
                 log.info(f"PATH_TRUNCATED at ({tx},{ty}) (position correction, no wait)")
+                if self.state.trunc_x == tx and self.state.trunc_y == ty:
+                    dynamic_blocks += 1
+                    if dynamic_blocks >= 2:
+                        blocked_tile: tuple[int, int] | None = _next_blocked
+                        if blocked_tile is None:
+                            fresh = pathfinder.find_path(cur_x, cur_y, x, y)
+                            if fresh:
+                                blocked_tile = (fresh[0][0] // 10, fresh[0][1] // 10)
+                        if blocked_tile:
+                            log.info(f"Dynamic block {blocked_tile} — repeated truncation at ({tx},{ty})")
+                            pathfinder.add_dynamic_block(*blocked_tile)
+                        dynamic_blocks = 0
+                else:
+                    dynamic_blocks = 0
 
             cur_x, cur_y = tx, ty
 
             if abs(cur_x - x) <= ARRIVE_WINDOW and abs(cur_y - y) <= ARRIVE_WINDOW:
                 break
-
-            # Block a tile when the same truncation fires repeatedly.
-            # The correct tile to block is the *next waypoint in the path we sent*
-            # immediately after the truncation tile — that is the step the server
-            # refused to allow.  Fall back to blocking the first step of a fresh
-            # path when the truncation tile wasn't in the sent path (i.e. the entire
-            # path was rejected before the player moved at all).
-            if self.state.trunc_x == tx and self.state.trunc_y == ty:
-                dynamic_blocks += 1
-                if dynamic_blocks >= 2:
-                    trunc_tile_x = tx // 10
-                    trunc_tile_z = ty // 10
-                    blocked_tile: tuple[int, int] | None = None
-
-                    # Search the last sent path for the truncation tile.
-                    for i, (px, pz) in enumerate(_last_path_sent):
-                        if px // 10 == trunc_tile_x and pz // 10 == trunc_tile_z:
-                            if i + 1 < len(_last_path_sent):
-                                blocked_tile = (_last_path_sent[i + 1][0] // 10,
-                                                _last_path_sent[i + 1][1] // 10)
-                            break
-
-                    if blocked_tile is None:
-                        # Truncation was at the start / not in path → block first step.
-                        fresh = pathfinder.find_path(cur_x, cur_y, x, y)
-                        if fresh:
-                            blocked_tile = (fresh[0][0] // 10, fresh[0][1] // 10)
-
-                    if blocked_tile:
-                        log.info(f"Dynamic block {blocked_tile} — repeated truncation at ({tx},{ty})")
-                        pathfinder.add_dynamic_block(*blocked_tile)
-                    dynamic_blocks = 0
-            else:
-                dynamic_blocks = 0
 
             log.info(f"Re-pathing from ({cur_x},{cur_y}) to ({x},{y})")
             n_steps, travel_sec = await _send_path_from(cur_x, cur_y)
@@ -778,10 +781,12 @@ class Bot:
     async def run(self, mode: str = "woodcutting"):
         pathfinder.load_walls()
         pathfinder.load_tiles()
+        pathfinder.load_heights()
         pathfinder.load_dynamic_blocks()
         log.info(f"Pathfinder ready — {len(pathfinder._walls)} walls, "
-                 f"{len(pathfinder._blocked_tiles)} blocked tiles, "
-                 f"{len(pathfinder._dynamic_blocked)} dynamic blocks loaded")
+                 f"{len(pathfinder._blocked_tiles)} water tiles, "
+                 f"{len(pathfinder._heights)} height tiles, "
+                 f"{len(pathfinder._dynamic_blocked)} dynamic blocks")
 
         loop = asyncio.get_running_loop()
         self._token, self._device_id, self._device_cookie = await loop.run_in_executor(None, self._http_login_sync)
