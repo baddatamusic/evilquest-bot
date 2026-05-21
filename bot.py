@@ -2,12 +2,12 @@
 EvilQuest bot — woodcutting and combat modes.
 
 Protocol facts confirmed from live sniff:
-  - Own position: opcode 122 → [x, y, hp, max_hp, tick, 0]
+  - Own position: opcode 122 (PLAYER_SELF_SYNC) → [x, y, hp, max_hp, tick, 0]
   - NPC_SYNC (11): one NPC per packet → [entity_id, type_id, x, y, hp, max_hp] (stride 6)
-  - Object sync: opcode 55 → [entity_id, type_id, x, y, 0, 0, rotation, 0]
-  - Ground items: opcode 12 → [entity_id, item_id, quantity, x, y]
+  - Object sync: WORLD_OBJECT_SYNC (55) → [entity_id, type_id, x, y, 0, 0, rotation, 0]
+  - Ground items: GROUND_ITEM_SYNC (12) → [entity_id, item_id, quantity, x, y]
   - PLAYER_SYNC (10): OTHER players, format [entity_id, x, y, hp, max_hp, ...]
-  - NPC name: opcode 84 (string) → str=name, vals=[entity_id]
+  - NPC name: NPC_NAME (84, string) → str=name, vals=[entity_id]
   - LOGIN_OK (1): vals=[own_entity_id, x, y, ...]
   - COMBAT_HIT (30): vals=[attacker_entity_id, target_entity_id, damage]
   - ENTITY_DEATH (31): vals=[entity_id]
@@ -29,10 +29,8 @@ import logging
 import os
 import random
 
-import requests
-
 from protocol import C, S, SERVER_NAMES, pack, pack_str, unpack, try_unpack_str
-from ws_transport import GameWebSocket, derive_key, build_nonce
+from ws_transport import GameWebSocket, http_login
 import pathfinder
 
 logging.basicConfig(
@@ -43,7 +41,6 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 BASE_URL = "https://evilquest.net"
-WS_URL   = "wss://evilquest.net/ws/game"
 
 # ── Item / NPC constants ──────────────────────────────────────────────────────
 LOG_ITEM_ID      = 23
@@ -66,13 +63,11 @@ DEFAULT_COW_Y = 1720
 
 EQUIP_SLOTS = ["weapon", "shield", "head", "body", "legs", "feet", "cape", "ring", "ammo"]
 
-# ── Opcodes not in protocol.py enums ─────────────────────────────────────────
-OP_OWN_STATE   = 122
-OP_OBJECT_SYNC =  55
-OP_GROUND_ITEM =  12
-OP_NPC_NAME    =  84
+# All opcodes now live in protocol.py as S.* / C.* logical constants.
+# The transport layer translates to/from wire opcodes transparently.
 
-ARRIVE_WINDOW = 25   # x10 units — consider arrived when within this distance
+ARRIVE_WINDOW = 25          # x10 units — consider arrived when within this distance
+WALK_TILES_PER_SEC = 1.67  # from GameManager.js moveSpeed constant
 
 
 # ── Game state ────────────────────────────────────────────────────────────────
@@ -160,7 +155,9 @@ class Bot:
         self.cow_y       = cow_y
         self.state       = State()
         self.ws: GameWebSocket | None = None
-        self._token: str = ""
+        self._token:          str = ""
+        self._device_id:      str = ""
+        self._device_cookie:  str = ""
         self._sell_lock  = asyncio.Lock()
 
         self._trunc_at: tuple[int, int] | None = None
@@ -169,19 +166,11 @@ class Bot:
 
     # ── Network ──────────────────────────────────────────────────────────────
 
-    def _http_login_sync(self) -> str:
-        resp = requests.post(
-            f"{BASE_URL}/api/login",
-            json={"username": self.username, "password": self.password},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        token = data.get("token")
-        if not token:
-            raise RuntimeError(f"Login failed: {data}")
-        log.info("HTTP login OK")
-        return token
+    def _http_login_sync(self) -> tuple[str, str, str]:
+        """Returns (auth_token, device_id, device_cookie)."""
+        token, device_id, cookie = http_login(self.username, self.password)
+        log.info("HTTP login OK — device_id=%s", device_id[:8] + "…")
+        return token, device_id, cookie
 
     async def _send(self, data: bytes):
         await self.ws.send(data)
@@ -196,16 +185,10 @@ class Bot:
                 self.state.own_entity_id = vals[0]
                 if len(vals) >= 3:
                     self.state.x, self.state.y = vals[1], vals[2]
-            # Derive session cipher key from nonce in vals[5:9]
-            if len(vals) >= 9 and self.ws is not None and not self.ws.cipher_active:
-                nonce = build_nonce(vals[5:9])
-                key   = derive_key(self._token, nonce)
-                self.ws.set_cipher(key, nonce)
-                log.info(f"Cipher active — nonce={nonce.hex()}")
             log.info(f"LOGIN_OK entity_id={self.state.own_entity_id} pos=({self.state.x},{self.state.y})")
             self.state.ev_login_ok.set()
 
-        elif op == OP_OWN_STATE:
+        elif op == S.PLAYER_SELF_SYNC:
             prev_hp = self.state.hp
             if len(vals) >= 2:
                 self.state.x, self.state.y = vals[0], vals[1]
@@ -248,12 +231,18 @@ class Bot:
                 eid, tid, nx, ny = vals[:4]
                 self.state.npcs[eid] = (tid, nx, ny, 0, 0)
 
-        elif op == OP_OBJECT_SYNC:
+        elif op == S.WORLD_OBJECT_SYNC:
             if len(vals) >= 4:
                 eid, tid, ox, oy = vals[:4]
                 self.state.objects[eid] = (tid, ox, oy)
 
-        elif op == OP_GROUND_ITEM:
+        elif op == S.WORLD_OBJECT_DEPLETED:
+            if vals:
+                dep_eid = vals[0]
+                self.state.objects.pop(dep_eid, None)
+                log.debug(f"WORLD_OBJECT_DEPLETED entity={dep_eid}")
+
+        elif op == S.GROUND_ITEM_SYNC:
             if len(vals) >= 5:
                 eid, iid, qty, gx, gy = vals[:5]
                 if qty > 0:
@@ -284,7 +273,8 @@ class Bot:
 
         elif op == S.SKILLING_STOP:
             log.info(f"SKILLING_STOP {vals}")
-            self.state.logs_chopped += 1
+            self.state.logs_chopped    += 1
+            self.state.logs_in_inventory += 1   # logs go directly to inventory
             self.state.ev_skilling_stop.set()
 
         elif op == S.DIALOGUE_OPEN:
@@ -332,13 +322,13 @@ class Bot:
         elif op == S.LEVEL_UP:
             log.info(f"LEVEL_UP {vals}")
 
-        elif op == S.PLAYER_EQUIP:
+        elif op == S.PLAYER_EQUIPMENT:
             self.state.equipped.clear()
             for i, slot in enumerate(EQUIP_SLOTS):
                 item_id = vals[i] if i < len(vals) else 0
                 if item_id:
                     self.state.equipped[slot] = item_id
-            log.info(f"PLAYER_EQUIP equipped={self.state.equipped}")
+            log.info(f"PLAYER_EQUIPMENT equipped={self.state.equipped}")
 
         elif op == S.PLAYER_STATS:
             log.debug(f"PLAYER_STATS vals={vals}")
@@ -385,87 +375,118 @@ class Bot:
         return pack(C.PLAYER_MOVE, *args)
 
     async def _move(self, x: int, y: int, timeout: float | None = None):
-        dist = abs(self.state.x - x) + abs(self.state.y - y)
-        if timeout is None:
-            timeout = max(15.0, dist * 0.3)
+        """
+        Move to (x, y) in x10 coordinates.
+
+        The server never sends position updates during normal movement — the JS client
+        uses client-side prediction (moveSpeed=1.67 tiles/sec).  We mirror that here:
+        estimate travel time from path length, sleep, then assume arrival.
+
+        If the server sends PATH_TRUNCATED the position IS updated and we re-path.
+        If the server sends PLAYER_SELF_SYNC (rare correction) the position is updated too.
+        """
+        if abs(self.state.x - x) <= ARRIVE_WINDOW and abs(self.state.y - y) <= ARRIVE_WINDOW:
+            return
 
         log.info(f"Moving to ({x},{y}), currently at ({self.state.x},{self.state.y})")
         self.ev_path_truncated.clear()
-        await self._send(self._build_move_packet(x, y))
+        self._trunc_at    = None
+        self._trunc_count = 0
 
-        deadline         = asyncio.get_event_loop().time() + timeout
-        pos_at_last_send = (self.state.x, self.state.y)
-        last_resend      = asyncio.get_event_loop().time()
+        async def _send_path_from(sx: int, sz: int) -> int:
+            """Send a move packet from (sx,sz) to (x,y). Returns waypoint count."""
+            path = pathfinder.find_path(sx, sz, x, y)
+            if path:
+                chunk = path[:50]
+                args  = [len(chunk)]
+                for wx, wz in chunk:
+                    args.extend([wx, wz])
+                await self._send(pack(C.PLAYER_MOVE, *args))
+                return len(chunk)
+            else:
+                await self._send(pack(C.PLAYER_MOVE, 1, x, y))
+                return max(1, (abs(sx - x) + abs(sz - y)) // 10)
 
-        while asyncio.get_event_loop().time() < deadline:
-            # Wait up to 2 s for either normal position polling or a PATH_TRUNCATED event.
+        n_steps    = await _send_path_from(self.state.x, self.state.y)
+        travel_sec = n_steps / WALK_TILES_PER_SEC
+
+        if timeout is None:
+            timeout = max(15.0, travel_sec * 2.5)
+
+        loop    = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        elapsed  = 0.0
+
+        # Sleep through estimated travel time, waking early on PATH_TRUNCATED
+        while elapsed < travel_sec and loop.time() < deadline:
+            remaining = travel_sec - elapsed
             try:
-                await asyncio.wait_for(self.ev_path_truncated.wait(), timeout=2.0)
+                await asyncio.wait_for(self.ev_path_truncated.wait(), timeout=min(1.0, remaining))
+                self.ev_path_truncated.clear()
             except asyncio.TimeoutError:
-                pass
-            self.ev_path_truncated.clear()
+                elapsed += 1.0
+                continue
 
+            # PATH_TRUNCATED: server gave us our actual position — re-path from there
             cx, cy = self.state.x, self.state.y
+
             if abs(cx - x) <= ARRIVE_WINDOW and abs(cy - y) <= ARRIVE_WINDOW:
-                log.info(f"Arrived at ({cx},{cy})")
+                log.info(f"Arrived at ({cx},{cy}) (PATH_TRUNCATED near destination)")
                 return
 
-            now = asyncio.get_event_loop().time()
-
-            # PATH_TRUNCATED logic: on the second truncation at the same spot, block the tile
-            # our pathfinder was trying to route through and re-pathfind around it.
-            if self._trunc_at == (cx, cy) and self._trunc_count >= 2:
+            if self._trunc_count >= 2:
                 fresh = pathfinder.find_path(cx, cy, x, y)
                 if fresh:
                     bx10, bz10 = fresh[0]
-                    btx, btz = bx10 // 10, bz10 // 10
-                    log.info(f"Dynamic block tile ({btx},{btz}) — repeated PATH_TRUNCATED at ({cx},{cy})")
+                    btx, btz   = bx10 // 10, bz10 // 10
+                    log.info(f"Dynamic block ({btx},{btz}) — repeated PATH_TRUNCATED at ({cx},{cy})")
                     pathfinder.add_dynamic_block(btx, btz)
                 self._trunc_count = 0
                 self._trunc_at    = None
-                await self._send(self._build_move_packet(x, y))
-                pos_at_last_send = (cx, cy)
-                last_resend      = now
-            elif self._trunc_at == (cx, cy) and self._trunc_count == 1:
-                # First truncation — resend immediately from new position.
-                await self._send(self._build_move_packet(x, y))
-                pos_at_last_send = (cx, cy)
-                last_resend      = now
-            elif now - last_resend > 12.0:
-                # Periodic resend only when we've actually moved since last send.
-                if (cx, cy) != pos_at_last_send:
-                    remaining = pathfinder.find_path(cx, cy, x, y)
-                    if remaining:
-                        chunk = remaining[:50]
-                        args  = [len(chunk)]
-                        for wx, wz in chunk:
-                            args.extend([wx, wz])
-                        await self._send(pack(C.PLAYER_MOVE, *args))
-                    else:
-                        await self._send(pack(C.PLAYER_MOVE, 1, x, y))
-                    pos_at_last_send = (cx, cy)
-                last_resend = now
 
-        log.warning(f"Move timed out at ({self.state.x},{self.state.y}), wanted ({x},{y})")
+            log.info(f"PATH_TRUNCATED, re-pathing from ({cx},{cy})")
+            n_steps    = await _send_path_from(cx, cy)
+            travel_sec = n_steps / WALK_TILES_PER_SEC
+            elapsed    = 0.0
+
+        # Check if a PLAYER_SELF_SYNC already moved us there
+        cx, cy = self.state.x, self.state.y
+        if abs(cx - x) <= ARRIVE_WINDOW and abs(cy - y) <= ARRIVE_WINDOW:
+            log.info(f"Arrived at ({cx},{cy}) (server confirmed)")
+        else:
+            # Client-side prediction: assume we reached the destination
+            log.info(f"Movement done ({n_steps} steps ≈ {travel_sec:.1f}s), assuming at ({x},{y})")
+            self.state.x, self.state.y = x, y
 
     # ── Woodcutting ───────────────────────────────────────────────────────────
 
     async def _chop_tree(self) -> bool:
+        # Decide where to move first
         trees = self.state.nearby_trees()
         if trees:
-            eid, _, tx, ty = trees[0]
-            log.info(f"Chopping nearest tree entity={eid} at ({tx},{ty})")
+            _, _, tx, ty = trees[0]
         else:
-            eid, tx, ty = self.tree_entity, self.tree_x, self.tree_y
-            log.info(f"No trees in object sync yet, using default entity={eid} at ({tx},{ty})")
+            tx, ty = self.tree_x, self.tree_y
+            log.info(f"No trees visible yet — moving to tree area ({tx},{ty})")
 
         self.state.ev_skilling_start.clear()
         self.state.ev_skilling_stop.clear()
 
         await self._move(tx, ty)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)   # let WORLD_OBJECT_SYNC packets arrive for the new area
 
-        await self._send(pack(C.PLAYER_INTERACT_OBJECT, eid))
+        # Re-scan after arriving — trees in the area should now be in state.objects
+        trees = self.state.nearby_trees()
+        if trees:
+            eid, _, tx, ty = trees[0]
+            log.info(f"Chopping tree entity={eid} at ({tx},{ty})")
+        else:
+            eid, tx, ty = self.tree_entity, self.tree_x, self.tree_y
+            log.warning(f"No trees in sync after move, using default entity={eid} at ({tx},{ty})")
+
+        # PLAYER_INTERACT_OBJECT format: (entity_id, action_index)
+        # action_index 0 = first interaction option (e.g. "Chop" for trees)
+        await self._send(pack(C.PLAYER_INTERACT_OBJECT, eid, 0))
 
         try:
             await asyncio.wait_for(self.state.ev_skilling_start.wait(), timeout=6.0)
@@ -479,13 +500,9 @@ class Bot:
             log.warning("No SKILLING_STOP in 2 minutes")
             return False
 
-        await asyncio.sleep(0.3)
-        for g_eid, qty, gx, gy in self.state.ground_logs():
-            log.info(f"Picking up log entity={g_eid} qty={qty} at ({gx},{gy})")
-            await self._send(pack(C.PLAYER_PICKUP, g_eid))
-            self.state.logs_in_inventory += qty
-            await asyncio.sleep(0.3)
-
+        # Logs go directly to inventory in EvilQuest (no ground pickup needed).
+        # logs_in_inventory is incremented in the SKILLING_STOP handler.
+        await asyncio.sleep(0.2)
         return True
 
     async def _sell_logs(self):
@@ -632,12 +649,25 @@ class Bot:
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
     async def _heartbeat_loop(self):
-        seq = 0
+        """
+        Heartbeat mirrors the browser: 5000–6200 ms jittered interval (matches
+        _a=5000, Ra=1200 in GameManager.js).  Also sends CLIENT_ACTIVITY to
+        simulate the user being at the keyboard.
+        """
+        seq              = 0
+        last_activity    = 0.0
+        loop             = asyncio.get_running_loop()
         while True:
-            await asyncio.sleep(5.0)
+            delay = 5.0 + random.uniform(0.0, 1.2)
+            await asyncio.sleep(delay)
+            now = loop.time()
             seq = (seq + 1) & 32767
             try:
                 await self.ws.send(pack(C.CLIENT_PING, seq))
+                # Send CLIENT_ACTIVITY no more than once every 5 s
+                if now - last_activity >= 5.0:
+                    await self.ws.send(pack(C.CLIENT_ACTIVITY))
+                    last_activity = now
             except Exception:
                 break
 
@@ -650,12 +680,12 @@ class Bot:
                  f"{len(pathfinder._blocked_tiles)} blocked tiles loaded")
 
         loop = asyncio.get_running_loop()
-        self._token = await loop.run_in_executor(None, self._http_login_sync)
+        self._token, self._device_id, self._device_cookie = await loop.run_in_executor(None, self._http_login_sync)
 
-        ws = GameWebSocket()
-        await ws.connect(self._token)
+        ws = GameWebSocket(self._token, self._device_id, self._device_cookie)
+        await ws.connect()   # performs CRYPTO_CHALLENGE/RESPONSE + OPCODE_MAPPING
         self.ws = ws
-        log.info("WebSocket connected")
+        log.info("WebSocket connected + crypto handshake complete")
 
         recv      = asyncio.create_task(self._recv_loop())
         heartbeat = asyncio.create_task(self._heartbeat_loop())
@@ -690,10 +720,10 @@ class Bot:
 
     async def sniff(self):
         loop = asyncio.get_running_loop()
-        self._token = await loop.run_in_executor(None, self._http_login_sync)
+        self._token, self._device_id, self._device_cookie = await loop.run_in_executor(None, self._http_login_sync)
 
-        ws = GameWebSocket()
-        await ws.connect(self._token)
+        ws = GameWebSocket(self._token, self._device_id, self._device_cookie)
+        await ws.connect()
         self.ws = ws
         log.info("SNIFF MODE — go play the game now. Press Ctrl+C to stop.")
 
@@ -705,17 +735,10 @@ class Bot:
             if data is None:
                 continue
 
-            # Set cipher on LOGIN_OK so we see decrypted sniff traffic
             op, vals = unpack(data)
-            if op == S.LOGIN_OK and len(vals) >= 9 and not ws.cipher_active:
-                nonce = build_nonce(vals[5:9])
-                key   = derive_key(self._token, nonce)
-                ws.set_cipher(key, nonce)
-                log.info("Cipher active (sniff)")
-
             name   = SERVER_NAMES.get(op, f"op_{op}")
             parsed = try_unpack_str(data)
-            if parsed and not all(32 <= ord(c) < 127 or c == '\x00' for c in parsed[0]):
+            if parsed and not all(32 <= ord(c) < 127 or c == "\x00" for c in parsed[0]):
                 print(f"  {name:20s} vals={vals}")
             elif parsed and parsed[0]:
                 print(f"  {name:20s} str={parsed[0]!r:30s} vals={parsed[1]}")
