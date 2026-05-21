@@ -1,4 +1,4 @@
-# EvilQuest Bot · v3.0
+# EvilQuest Bot · v3.1
 
 Automation bot for [EvilQuest](https://evilquest.net) supporting woodcutting and combat modes.  
 Fully implements the **evilquest-game-v2** WebSocket protocol including ECDH key exchange, per-session opcode remapping, and AES-256-GCM encrypted frames.
@@ -11,7 +11,7 @@ Fully implements the **evilquest-game-v2** WebSocket protocol including ECDH key
 - **Combat mode** — finds and attacks cows, walks back to the combat area on death
 - **Sniff mode** — passive packet logger; play the game manually while the bot prints every decoded message (useful for reverse engineering)
 - Automatic reconnect-safe login: fetches a server-issued device ID, registers a persistent ECDSA signing key, and negotiates a fresh session on every run
-- A\* pathfinder with wall and water-tile blocking; dynamic tile blocking on repeated `PATH_TRUNCATED` signals
+- A\* pathfinder with wall, water-tile, and **height-based cliff blocking** (pre-computed from terrain height chunks); dynamic tile learning via `PATH_TRUNCATED` catches any missed edges
 - Jittered heartbeat (5.0–6.2 s) with `CLIENT_ACTIVITY` to pass behavioural checks
 
 ---
@@ -30,7 +30,7 @@ Install dependencies:
 pip install cryptography requests
 ```
 
-Map assets (walls, tile chunks) must be present under `gameassets/maps/kcmap/`.  
+Map assets (walls, tile chunks, height chunks) must be present under `gameassets/maps/kcmap/`.  
 Run `scrape_assets.py` once to download them if missing.
 
 ---
@@ -66,6 +66,7 @@ On first run the bot generates the signing key and registers it with the server 
 
 | Version | Date | Summary |
 |---|---|---|
+| **3.1** | May 2026 | Height-based cliff pre-computation (≥78 % of cliff tiles blocked at startup); on-path immediate blocking; Euclidean wait-time; `.env` credential loading |
 | **3.0** | May 2026 | Dynamic obstacle persistence; robust `_move()` position tracking; on-path/off-path PATH_TRUNCATED detection; A* tuning |
 | **2.0** | May 2026 | Full evilquest-game-v2 protocol rewrite (ECDH, AES-256-GCM, opcode remapping, signing key) |
 | **1.0** | — | Initial release (v1 protocol, static key, basic woodcutting) |
@@ -73,6 +74,60 @@ On first run the bot generates the signing key and registers it with the server 
 ---
 
 ## Changelog
+
+---
+
+### v3.1 — Height-based cliff detection + credential management (May 2026)
+
+#### Background
+
+After v3.0's dynamic block learning, the bot was still spending the first 2–5 minutes of each run re-learning the cliff from scratch (PATH_TRUNCATED events required 2 occurrences before blocking a tile, and 233 blocks × ~1.5 s each = significant delay).  
+Two improvements were made: (1) pre-compute cliff tiles from the terrain height data already present on disk, and (2) block on the first on-path truncation instead of waiting for a second.
+
+---
+
+#### 3.1.1 Height-based cliff pre-computation (`pathfinder.py`)
+
+| What changed | Why |
+|---|---|
+| Added `_HEIGHTS_DIR` pointing to `gameassets/maps/kcmap/heights/` | Location of per-chunk terrain height files |
+| Added `HEIGHT_CLIFF_THRESHOLD = 0.7` constant | Height difference (game units) above which an edge between two tiles is treated as impassable |
+| Added `_heights` dict and `load_heights()` | Reads all 16 `chunk_CX_CZ.json` height files at startup; keys are `(global_x, global_z)` tile coords, values are floats |
+| `_is_wall_blocked()` checks height diff before wall bitmask | If `abs(h_from − h_to) > 0.7`, the edge is blocked — no server round-trip needed |
+| `find_path()` auto-calls `load_heights()` on first invocation | Heights always loaded before the first A\* search |
+
+**Calibration:** empirical testing against 233 known cliff blocks showed threshold `0.75` matches 78 % of them; `1.0` matches 55 %.  
+`HEIGHT_CLIFF_THRESHOLD = 0.7` recovers a few additional edges.  The remaining misses are still caught by PATH_TRUNCATED dynamic learning.
+
+Height data format (sparse JSON):
+```json
+{ "row,col": float_height, ... }
+```
+`row` = local z, `col` = local x within the 64×64 chunk.  Tiles absent from the file default to height `0.0`.
+
+---
+
+#### 3.1.2 On-path immediate blocking (`bot.py`)
+
+**Problem:** the old code required 2 PATH_TRUNCATED events at the same `(trunc_x, trunc_y)` position before blocking the implied tile.  
+For an on-path truncation this is one round-trip too many: if the player is walking *toward* tile T and the server sends `PATH_TRUNCATED` with endpoint T, then the tile *after* T in the sent path is definitively blocked.
+
+**Fix:** on on-path truncation, look up the truncation tile in `_last_path_sent` and immediately call `pathfinder.add_dynamic_block()` for the next tile in the list.  The 2-occurrence gate is retained only for off-path (position-correction) truncations.
+
+---
+
+#### 3.1.3 Euclidean wait-time (`bot.py`)
+
+Diagonal moves are `√2 ≈ 1.414` tiles long but the old wait-time calculation used Manhattan distance (overestimates by up to 41 % on diagonals).  
+Fixed: `trunc_dist_tiles = math.sqrt((cur_x − tx)² + (cur_y − tz)²) / 10.0`.
+
+---
+
+#### 3.1.4 `.env` credential loading (`bot.py`)
+
+Added `_load_dotenv()`: reads `key=value` pairs from `.env` (same directory as `bot.py`) into `os.environ` at import time.  
+`--username` and `--password` CLI flags now default to `EVILQUEST_USER` / `EVILQUEST_PASSWORD` from the environment; they become optional when `.env` is present.  
+The `.env` file is listed in `.gitignore` and never tracked.
 
 ---
 
@@ -329,6 +384,7 @@ gameassets/
   maps/kcmap/
     walls.json      — wall bitmask data (N/E/S/W per tile)
     tiles/          — chunk_CX_CZ.json files (water tile blocking)
+    heights/        — chunk_CX_CZ.json files (terrain height per tile; cliff detection)
 ~/.evilquest/
   device.json           — cached server device ID + eq_device_id cookie
   signing_key.json      — persistent ECDSA P-256 private key (JWK)
