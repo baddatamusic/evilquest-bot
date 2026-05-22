@@ -38,7 +38,9 @@ import base64
 import hashlib
 import http.client
 import json
+import logging
 import os
+import random
 import secrets
 import ssl
 import struct
@@ -69,21 +71,30 @@ STATE_DIR = Path.home() / ".evilquest"
 
 # Client-side logical opcodes that ARE in the opcode mapping
 # (all client opcodes except LOGIN=1 and CRYPTO_RESPONSE=2)
+#
+# Removed in latest game update:
+#   100-105  — DUEL_REQUEST / DUEL_ACCEPT_REQUEST / DUEL_DECLINE /
+#              DUEL_STAKE_ITEM / DUEL_REMOVE_STAKE / DUEL_ACCEPT  (duel system removed)
+#   121      — CLIENT_ACTIVITY  (removed from client enum entirely)
 _CLIENT_LOGICAL = sorted({
     10, 20, 21, 22, 23, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 44, 45,
-    50, 60, 70, 71, 80, 81, 82, 83, 90, 91, 92, 93, 94, 95,
-    100, 101, 102, 103, 104, 105, 120, 121,
+    50, 60, 70, 71, 80, 81, 82, 83, 90, 91, 92, 93, 94, 95, 120,
 })
 
 # Server-side logical opcodes that ARE in the opcode mapping
 # (all server opcodes except CRYPTO_CHALLENGE=2 and OPCODE_MAPPING=3)
+#
+# Removed in latest game update:
+#   96-99, 101-103  — DUEL server opcodes (DUEL_REQUEST_RECEIVED, DUEL_OPEN,
+#                     DUEL_STAKE_UPDATE, DUEL_ACCEPT_STATE, DUEL_CLOSE,
+#                     DUEL_START, DUEL_FINISH)  — duel system removed entirely
 _SERVER_LOGICAL = sorted({
     1, 10, 11, 12, 21, 22, 23, 24, 25, 26,
     30, 31, 32, 33, 34, 35, 42, 50, 55, 56, 57, 58, 59,
     60, 61, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
     80, 81, 82, 84, 85, 86, 87, 88,
-    90, 91, 92, 93, 94, 95, 96, 97, 98, 99,
-    100, 101, 102, 103, 110, 111, 120, 121, 122,
+    90, 91, 92, 93, 94, 95,
+    100, 110, 111, 120, 121, 122,
 })
 
 # ── Base64url helpers ─────────────────────────────────────────────────────────
@@ -449,6 +460,248 @@ _API_HEADERS = {
 }
 
 
+_log = logging.getLogger("ws_transport")
+
+# ── pydoll / reCAPTCHA-aware browser login ────────────────────────────────────
+
+async def async_http_login(username: str, password: str) -> tuple[str, str, str]:
+    """
+    Browser-based login using pydoll (Chrome DevTools Protocol) to handle
+    reCAPTCHA v3 transparently.
+
+    Flow:
+      1. Launch a headless Chrome instance.
+      2. Navigate to https://evilquest.net/play — the page's own JS runs
+         reCAPTCHA v3 silently in the background.
+      3. GET /api/device-id (via browser-context fetch) to obtain device UUID.
+      4. Fill the login form with human-like typing & click Submit.
+      5. Poll localStorage["projectrs_token"] until the token appears
+         (set by the page's own login handler after a successful /api/login call).
+      6. POST /api/device-key (via browser-context fetch) to register our
+         persistent ECDSA signing key.
+      7. Export all cookies for the WebSocket upgrade header.
+
+    Returns (auth_token, device_id, cookie_header_string).
+    """
+    try:
+        from pydoll.browser.chromium import Chrome
+        from pydoll.browser.options import Options
+        from pydoll.constants import Key
+    except ImportError as exc:
+        raise ImportError(
+            "pydoll-python is required for reCAPTCHA-aware login. "
+            "Install it with:  pip install pydoll-python"
+        ) from exc
+
+    options = Options()
+    # Use Chrome's new headless mode — much closer to a real browser than legacy
+    # headless and therefore scores better on reCAPTCHA v3.
+    options.add_argument("--headless=new")
+    options.add_argument("--window-size=1280,800")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-infobars")
+
+    # Use the system-installed Chrome on Windows
+    _chrome_win = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    if os.path.exists(_chrome_win):
+        options.binary_location = _chrome_win
+
+    _log.info("pydoll: launching headless Chrome for reCAPTCHA-aware login…")
+
+    async with Chrome(options=options) as browser:
+        tab = await browser.start()
+
+        # ── 1. Navigate to game page ──────────────────────────────────────────
+        # The page loads reCAPTCHA v3 scripts and starts passive behavioural
+        # scoring as soon as it renders.  We wait 2 s to let it initialise.
+        _log.info("pydoll: navigating to evilquest.net/play")
+        await tab.go_to("https://evilquest.net/play")
+        await asyncio.sleep(2.0)
+
+        # ── 2. Obtain device UUID ─────────────────────────────────────────────
+        device_id: str = ""
+        try:
+            resp = await tab.request.get("https://evilquest.net/api/device-id")
+            ddata = resp.json()
+            device_id = ddata.get("deviceId", "")
+            if device_id:
+                _log.info("pydoll: device_id=%s…", device_id[:8])
+        except Exception as exc:
+            _log.warning("pydoll: /api/device-id failed (%s) — will use stored or empty", exc)
+
+        # ── 3. Find the login form ────────────────────────────────────────────
+        _log.info("pydoll: locating login form inputs")
+
+        # Some SPAs hide the login form behind a modal.  Try to find inputs
+        # directly first; if not present, look for a "Login" trigger to click.
+        user_field = await tab.query(
+            'input[type="text"]', timeout=4, raise_exc=False
+        )
+        if user_field is None:
+            # Look for a login button/link that opens the form
+            for _trigger_text in ("Login", "Sign In", "Log In"):
+                trigger = await tab.find(
+                    tag_name="button", text=_trigger_text, timeout=2, raise_exc=False
+                )
+                if trigger is None:
+                    trigger = await tab.find(
+                        tag_name="a", text=_trigger_text, timeout=1, raise_exc=False
+                    )
+                if trigger:
+                    _log.info("pydoll: clicking '%s' trigger to open login form", _trigger_text)
+                    await trigger.click()
+                    await asyncio.sleep(1.0)
+                    break
+
+            # Retry — also cover forms that use type="email" or omit the type
+            user_field = await tab.query(
+                'input[type="text"]', timeout=6, raise_exc=False
+            )
+            if user_field is None:
+                user_field = await tab.query(
+                    'input:not([type="password"]):not([type="hidden"])'
+                    ':not([type="checkbox"]):not([type="submit"]):not([type="button"])',
+                    timeout=4, raise_exc=False,
+                )
+
+        if user_field is None:
+            raise RuntimeError(
+                "pydoll: could not locate username input on the login page. "
+                "Page structure may have changed."
+            )
+
+        pass_field = await tab.query(
+            'input[type="password"]', timeout=5, raise_exc=False
+        )
+        if pass_field is None:
+            raise RuntimeError(
+                "pydoll: could not locate password input on the login page. "
+                "Page structure may have changed."
+            )
+
+        # ── 4. Fill credentials with human-like timing ────────────────────────
+        _log.info("pydoll: filling credentials")
+        await user_field.click()
+        await asyncio.sleep(random.uniform(0.2, 0.4))
+        await user_field.type_text(username)
+        await asyncio.sleep(random.uniform(0.3, 0.6))
+
+        await pass_field.click()
+        await asyncio.sleep(random.uniform(0.2, 0.4))
+        await pass_field.type_text(password)
+        await asyncio.sleep(random.uniform(0.3, 0.6))
+
+        # ── 5. Submit the form ────────────────────────────────────────────────
+        _log.info("pydoll: submitting login form")
+        submit_btn = None
+        for _sel in ('button[type="submit"]',):
+            submit_btn = await tab.query(_sel, timeout=3, raise_exc=False)
+            if submit_btn:
+                break
+        if submit_btn is None:
+            for _txt in ("Login", "Log In", "Sign In", "Enter", "Play"):
+                submit_btn = await tab.find(
+                    tag_name="button", text=_txt, timeout=2, raise_exc=False
+                )
+                if submit_btn:
+                    break
+        if submit_btn is None:
+            submit_btn = await tab.find(tag_name="button", timeout=3, raise_exc=False)
+
+        if submit_btn:
+            await submit_btn.click()
+        else:
+            # Fallback: press Enter in the password field
+            _log.warning("pydoll: no submit button found — pressing Enter")
+            await tab.keyboard.press(Key.ENTER)
+
+        # ── 6. Wait for the auth token to appear in localStorage ──────────────
+        # The page's own login handler stores the token at
+        # localStorage["projectrs_token"] after a successful /api/login call.
+        _log.info("pydoll: waiting for auth token in localStorage…")
+        auth_token: str = ""
+        for attempt in range(40):        # up to 20 seconds
+            await asyncio.sleep(0.5)
+            result = await tab.execute_script(
+                "return localStorage.getItem('projectrs_token')"
+            )
+            value = (
+                result
+                .get("result", {})
+                .get("result", {})
+                .get("value")
+            )
+            if value and isinstance(value, str) and len(value) > 10:
+                auth_token = value
+                break
+            if attempt % 8 == 7:
+                _log.info("pydoll: still waiting for token (%ds)…", (attempt + 1) // 2)
+
+        if not auth_token:
+            # Try to surface any error text shown on the page
+            err_result = await tab.execute_script(
+                "return (document.querySelector('[class*=\"error\"],"
+                "[class*=\"Error\"],[class*=\"alert\"]')?.textContent || '').trim()"
+            )
+            err_msg = (
+                err_result
+                .get("result", {})
+                .get("result", {})
+                .get("value", "")
+            )
+            detail = f" — page error: {err_msg!r}" if err_msg else ""
+            raise RuntimeError(
+                f"pydoll: login failed — no token in localStorage after 20 s{detail}. "
+                "reCAPTCHA may have scored the session too low, or credentials are wrong."
+            )
+
+        _log.info("pydoll: token acquired — registering device key…")
+
+        # ── 7. Register / refresh the persistent ECDSA device signing key ─────
+        signing_key = load_signing_key()
+        if signing_key is None:
+            signing_key = generate_private_key(SECP256R1())
+            save_signing_key(signing_key)
+
+        pub_jwk = _ec_pub_to_jwk(signing_key.public_key(), key_ops=["verify"])
+        try:
+            dk_resp = await tab.request.post(
+                "https://evilquest.net/api/device-key",
+                json={"publicKey": pub_jwk},
+                headers=[{"name": "Authorization", "value": f"Bearer {auth_token}"}],
+            )
+            dk_data = dk_resp.json()
+            if not dk_data.get("ok"):
+                raise RuntimeError(f"device-key rejected: {dk_data}")
+            _log.info("pydoll: device-key registered OK")
+        except Exception as exc:
+            raise RuntimeError(f"pydoll: device-key registration failed: {exc}") from exc
+
+        # ── 8. Export cookies for the WebSocket upgrade header ────────────────
+        cookies = await tab.get_cookies()
+
+        # Filter to evilquest.net cookies and build a "name=value; …" string
+        cookie_str = "; ".join(
+            f"{c['name']}={c['value']}"
+            for c in cookies
+            if "evilquest" in c.get("domain", "")
+        )
+
+        # Persist device state for future sessions
+        eq_cookie = next(
+            (c["value"] for c in cookies if c["name"] == "eq_device_id"), ""
+        )
+        if device_id:
+            save_device_state(device_id, eq_cookie)
+
+    _log.info("pydoll: browser login complete")
+    return auth_token, device_id, cookie_str
+
+
+# ── Legacy direct-HTTP login (kept for reference; breaks on reCAPTCHA) ────────
+
 def http_login(username: str, password: str) -> tuple[str, str, str]:
     """
     Full HTTP login flow:
@@ -456,6 +709,11 @@ def http_login(username: str, password: str) -> tuple[str, str, str]:
       2. POST /api/login to get an auth token
       3. POST /api/device-key to register our ECDSA signing key (once per token)
     Returns (auth_token, device_id, cookie_header_string).
+
+    NOTE: This function is kept for reference but will fail against the current
+    server because /api/login now requires a reCAPTCHA v3 token that can only
+    be generated by running the page's JavaScript in a real browser.
+    Use async_http_login() instead.
     """
     session = requests.Session()
 

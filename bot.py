@@ -54,7 +54,7 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 from protocol import C, S, SERVER_NAMES, pack, pack_str, unpack, try_unpack_str
-from ws_transport import GameWebSocket, http_login
+from ws_transport import GameWebSocket, async_http_login
 import pathfinder
 
 logging.basicConfig(
@@ -120,6 +120,8 @@ class State:
         self._pending_map_ready = False
         self.trunc_x: int = 0   # last PATH_TRUNCATED tile (x10)
         self.trunc_y: int = 0
+
+        self.height_y: float = 0.0   # ground Y height (world units), used for CLIENT_POSITION_Y
 
         self.ev_login_ok         = asyncio.Event()
         self.ev_skilling_start   = asyncio.Event()
@@ -190,10 +192,11 @@ class Bot:
 
     # ── Network ──────────────────────────────────────────────────────────────
 
-    def _http_login_sync(self) -> tuple[str, str, str]:
-        """Returns (auth_token, device_id, device_cookie)."""
-        token, device_id, cookie = http_login(self.username, self.password)
-        log.info("HTTP login OK — device_id=%s", device_id[:8] + "…")
+    async def _http_login(self) -> tuple[str, str, str]:
+        """Browser-based login via pydoll (handles reCAPTCHA v3).
+        Returns (auth_token, device_id, device_cookie)."""
+        token, device_id, cookie = await async_http_login(self.username, self.password)
+        log.info("Browser login OK — device_id=%s", (device_id[:8] + "…") if device_id else "N/A")
         return token, device_id, cookie
 
     async def _send(self, data: bytes):
@@ -209,7 +212,12 @@ class Bot:
                 self.state.own_entity_id = vals[0]
                 if len(vals) >= 3:
                     self.state.x, self.state.y = vals[1], vals[2]
-            log.info(f"LOGIN_OK entity_id={self.state.own_entity_id} pos=({self.state.x},{self.state.y})")
+                if len(vals) >= 4:
+                    self.state.height_y = vals[3] / 10.0   # initial ground Y height
+            log.info(
+                f"LOGIN_OK entity_id={self.state.own_entity_id} "
+                f"pos=({self.state.x},{self.state.y}) height_y={self.state.height_y:.2f}"
+            )
             self.state.ev_login_ok.set()
 
         elif op == S.PLAYER_SELF_SYNC:
@@ -749,32 +757,65 @@ class Bot:
             else:
                 log.info(f"Cow {eid} defeated")
                 self.state.dead_npcs.discard(eid)
-                await asyncio.sleep(0.5)
+                # Human-like reaction time before engaging next target (0.3–1.5 s).
+                # Occasionally take a longer break to look less robotic (~5 % chance).
+                if random.random() < 0.05:
+                    idle = random.uniform(8.0, 20.0)
+                    log.info(f"Idle pause {idle:.1f}s (anti-detect)")
+                    await asyncio.sleep(idle)
+                else:
+                    await asyncio.sleep(random.uniform(0.3, 1.5))
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
     async def _heartbeat_loop(self):
         """
-        Heartbeat mirrors the browser: 5000–6200 ms jittered interval (matches
-        _a=5000, Ra=1200 in GameManager.js).  Also sends CLIENT_ACTIVITY to
-        simulate the user being at the keyboard.
+        Heartbeat mirrors the browser: 5000–6200 ms jittered interval
+        (Zo=5000 ms base, Ra=1200 ms max jitter in GameManager.js).
+
+        CLIENT_ACTIVITY (opcode 121) was removed from the game client enum
+        in the latest update — do NOT send it or the OPCODE_MAPPING handshake
+        will raise ValueError on a missing logical→wire entry.
         """
-        seq              = 0
-        last_activity    = 0.0
-        loop             = asyncio.get_running_loop()
+        seq = 0
         while True:
             delay = 5.0 + random.uniform(0.0, 1.2)
             await asyncio.sleep(delay)
-            now = loop.time()
             seq = (seq + 1) & 32767
             try:
                 await self.ws.send(pack(C.CLIENT_PING, seq))
-                # Send CLIENT_ACTIVITY no more than once every 5 s
-                if now - last_activity >= 5.0:
-                    await self.ws.send(pack(C.CLIENT_ACTIVITY))
-                    last_activity = now
             except Exception:
                 break
+
+    async def _position_y_loop(self):
+        """
+        Periodically report our ground Y-height to the server.
+
+        Mirrors reportYToServer() / updateIndoorDetection() in GameManager.js:
+          • Only sends when height changes by ≥ 0.05 world units
+          • 30-frame cooldown at 60 fps ≈ 0.5 s minimum interval
+          • Format: pack(C.CLIENT_POSITION_Y, round(height * 10))
+
+        The height comes from the pathfinder._heights dict which maps
+        (tile_x, tile_z) → float world-unit Y.  Tiles that don't appear in
+        the dict (void / unmapped) default to 0.0.
+        """
+        last_y: float | None = None
+        while True:
+            await asyncio.sleep(0.5)
+            if not self.ws:
+                continue
+            # Convert x10 state coords to tile indices
+            tx = self.state.x // 10
+            tz = self.state.y // 10
+            height = pathfinder._heights.get((tx, tz), 0.0)
+            # Only send when height changed by ≥ 0.05 (threshold from JS source)
+            if last_y is None or abs(height - last_y) >= 0.05:
+                try:
+                    await self.ws.send(pack(C.CLIENT_POSITION_Y, round(height * 10)))
+                    last_y = height
+                except Exception:
+                    break
 
     # ── Entry points ─────────────────────────────────────────────────────────
 
@@ -788,8 +829,7 @@ class Bot:
                  f"{len(pathfinder._heights)} height tiles, "
                  f"{len(pathfinder._dynamic_blocked)} dynamic blocks")
 
-        loop = asyncio.get_running_loop()
-        self._token, self._device_id, self._device_cookie = await loop.run_in_executor(None, self._http_login_sync)
+        self._token, self._device_id, self._device_cookie = await self._http_login()
 
         ws = GameWebSocket(self._token, self._device_id, self._device_cookie)
         await ws.connect()   # performs CRYPTO_CHALLENGE/RESPONSE + OPCODE_MAPPING
@@ -798,6 +838,7 @@ class Bot:
 
         recv      = asyncio.create_task(self._recv_loop())
         heartbeat = asyncio.create_task(self._heartbeat_loop())
+        pos_y     = asyncio.create_task(self._position_y_loop())
 
         try:
             await asyncio.wait_for(self.state.ev_login_ok.wait(), timeout=10.0)
@@ -818,18 +859,19 @@ class Bot:
                 recv.cancel()
                 watchdog.cancel()
                 heartbeat.cancel()
+                pos_y.cancel()
         else:
             try:
                 await self._combat_loop()
             finally:
                 recv.cancel()
                 heartbeat.cancel()
+                pos_y.cancel()
 
         await ws.close()
 
     async def sniff(self):
-        loop = asyncio.get_running_loop()
-        self._token, self._device_id, self._device_cookie = await loop.run_in_executor(None, self._http_login_sync)
+        self._token, self._device_id, self._device_cookie = await self._http_login()
 
         ws = GameWebSocket(self._token, self._device_id, self._device_cookie)
         await ws.connect()
