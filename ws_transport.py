@@ -42,8 +42,10 @@ import logging
 import os
 import random
 import secrets
+import shutil
 import ssl
 import struct
+import tempfile
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -399,6 +401,47 @@ def apply_opcode_map_recv(data: bytes, mapping: OpcodeMapping) -> bytes:
     return bytes(out)
 
 
+# ── Persistent auth state ────────────────────────────────────────────────────
+
+import time as _time
+
+_AUTH_TTL = 23 * 3600    # 23 hours — tokens expire after 24 h server-side
+
+
+def save_auth_state(token: str, device_id: str, cookie: str) -> None:
+    """Persist auth token + cookies so the next run can skip the browser login."""
+    _state_path("auth.json").write_text(json.dumps({
+        "token":     token,
+        "device_id": device_id,
+        "cookie":    cookie,
+        "ts":        _time.time(),
+    }))
+
+
+def load_auth_state() -> tuple[str, str, str] | None:
+    """
+    Load cached auth state if it is less than 23 hours old.
+    Returns (token, device_id, cookie_str) or None if expired / missing.
+    """
+    p = _state_path("auth.json")
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        age  = _time.time() - data.get("ts", 0)
+        if age < _AUTH_TTL:
+            _log.info(
+                "Reusing cached auth token (%.1f h old, expires in %.1f h)",
+                age / 3600,
+                (_AUTH_TTL - age) / 3600,
+            )
+            return data["token"], data["device_id"], data["cookie"]
+        _log.info("Cached auth token expired (%.1f h old) — need fresh login", age / 3600)
+    except Exception as exc:
+        _log.debug("Could not read auth cache: %s", exc)
+    return None
+
+
 # ── Persistent device state ───────────────────────────────────────────────────
 
 def _state_path(filename: str) -> Path:
@@ -464,6 +507,68 @@ _log = logging.getLogger("ws_transport")
 
 # ── pydoll / reCAPTCHA-aware browser login ────────────────────────────────────
 
+def _prepare_chrome_profile() -> str | None:
+    """
+    Copy the user's real Chrome Cookies file into a fresh temp profile
+    directory.  When Chrome starts with this profile it will have real
+    Google auth cookies, which boosts reCAPTCHA v3 scores dramatically.
+
+    Returns the temp dir path (caller must rmtree it), or None if the real
+    profile is unavailable (Chrome running & file locked, profile missing, …).
+    """
+    real_default = (
+        Path.home()
+        / "AppData/Local/Google/Chrome/User Data/Default"
+    )
+    # Chrome 80+ encrypts cookies with a key stored in User Data/Local State.
+    # We must copy BOTH the Cookies DB and Local State so Chrome can decrypt them.
+    user_data = real_default.parent          # …/Chrome/User Data
+    local_state = user_data / "Local State"
+    if not local_state.exists():
+        _log.debug("pydoll: Chrome Local State not found — using fresh profile")
+        return None
+
+    # Chrome 120+ moved cookies into a Network sub-directory; handle both layouts
+    for candidate in (
+        real_default / "Network" / "Cookies",
+        real_default / "Cookies",
+    ):
+        if candidate.exists():
+            cookies_src = candidate
+            break
+    else:
+        _log.debug("pydoll: Chrome Cookies file not found — using fresh profile")
+        return None
+
+    tmp = tempfile.mkdtemp(prefix="eq_chrome_")
+    try:
+        # Copy Local State to the root of the temp User Data dir (Chrome looks there
+        # for the AES key it needs to decrypt cookies)
+        shutil.copy2(local_state, Path(tmp) / "Local State")
+
+        # Recreate the same sub-directory structure Chrome expects
+        cookies_dest_dir = Path(tmp) / "Default" / cookies_src.parent.name
+        cookies_dest_dir.mkdir(parents=True)
+        shutil.copy2(cookies_src, cookies_dest_dir / "Cookies")
+
+        # Copy the journal file too (needed for WAL consistency)
+        journal = cookies_src.parent / "Cookies-journal"
+        if journal.exists():
+            shutil.copy2(journal, cookies_dest_dir / "Cookies-journal")
+
+        _log.info(
+            "pydoll: copied real Chrome profile (cookies from %s)",
+            cookies_src.parent.name,
+        )
+        return tmp
+    except (PermissionError, OSError) as exc:
+        _log.warning(
+            "pydoll: cannot copy Chrome profile (%s) — using fresh profile", exc
+        )
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+
+
 async def async_http_login(username: str, password: str) -> tuple[str, str, str]:
     """
     Browser-based login using pydoll (Chrome DevTools Protocol) to handle
@@ -483,9 +588,14 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
 
     Returns (auth_token, device_id, cookie_header_string).
     """
+    # ── Fast path: reuse a cached token if it's still fresh ──────────────────
+    cached = load_auth_state()
+    if cached:
+        return cached
+
     try:
         from pydoll.browser.chromium import Chrome
-        from pydoll.browser.options import Options
+        from pydoll.browser.options import ChromiumOptions
         from pydoll.constants import Key
     except ImportError as exc:
         raise ImportError(
@@ -493,32 +603,57 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
             "Install it with:  pip install pydoll-python"
         ) from exc
 
-    options = Options()
-    # Use Chrome's new headless mode — much closer to a real browser than legacy
-    # headless and therefore scores better on reCAPTCHA v3.
-    options.add_argument("--headless=new")
+    options = ChromiumOptions()
+    # Do NOT use --headless=new: reCAPTCHA v3 scores headless sessions too low.
+    # Do NOT use --no-sandbox: shows a security banner that makes the browser
+    # look suspicious and is only needed on Linux in a container.
     options.add_argument("--window-size=1280,800")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-position=0,0")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-infobars")
+
+    # Copy the user's real Chrome cookies into a temp profile so reCAPTCHA v3
+    # can use the Google auth cookies for a higher trust score.
+    _profile_dir: str | None = _prepare_chrome_profile()
+    if _profile_dir:
+        options.add_argument(f"--user-data-dir={_profile_dir}")
 
     # Use the system-installed Chrome on Windows
     _chrome_win = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
     if os.path.exists(_chrome_win):
         options.binary_location = _chrome_win
 
-    _log.info("pydoll: launching headless Chrome for reCAPTCHA-aware login…")
+    _log.info("pydoll: launching Chrome (visible) for reCAPTCHA-aware login…")
 
     async with Chrome(options=options) as browser:
         tab = await browser.start()
 
         # ── 1. Navigate to game page ──────────────────────────────────────────
-        # The page loads reCAPTCHA v3 scripts and starts passive behavioural
-        # scoring as soon as it renders.  We wait 2 s to let it initialise.
+        # First visit the root domain so cookies and reCAPTCHA session are
+        # established, then navigate to /play where the login form lives.
+        # reCAPTCHA v3 scores passively; we pause between pages to accumulate
+        # a higher trust score.
+        _log.info("pydoll: navigating to evilquest.net (root)")
+        await tab.go_to("https://evilquest.net")
+        await asyncio.sleep(2.0)
+
         _log.info("pydoll: navigating to evilquest.net/play")
         await tab.go_to("https://evilquest.net/play")
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(3.0)
+
+        # Simulate natural human mouse movement across the page before
+        # interacting with the form.  reCAPTCHA v3 monitors cursor behaviour.
+        try:
+            for _mx, _my in [
+                (640, 400), (300, 250), (750, 550), (500, 300),
+                (640, 400),
+            ]:
+                _mx += random.randint(-30, 30)
+                _my += random.randint(-20, 20)
+                await tab.mouse.move(_mx, _my, humanize=True)
+                await asyncio.sleep(random.uniform(0.2, 0.5))
+        except Exception:
+            pass   # mouse simulation is best-effort
 
         # ── 2. Obtain device UUID ─────────────────────────────────────────────
         device_id: str = ""
@@ -582,18 +717,33 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
             )
 
         # ── 4. Fill credentials with human-like timing ────────────────────────
+        # type_text(humanize=True) calls click() internally then types with
+        # randomised inter-keystroke delays — do NOT add an extra explicit click
+        # beforehand or the field ends up clicked twice.
         _log.info("pydoll: filling credentials")
-        await user_field.click()
-        await asyncio.sleep(random.uniform(0.2, 0.4))
-        await user_field.type_text(username)
-        await asyncio.sleep(random.uniform(0.3, 0.6))
+        await user_field.type_text(username, humanize=True)
+        await asyncio.sleep(random.uniform(0.4, 0.8))
 
-        await pass_field.click()
-        await asyncio.sleep(random.uniform(0.2, 0.4))
-        await pass_field.type_text(password)
-        await asyncio.sleep(random.uniform(0.3, 0.6))
+        await pass_field.type_text(password, humanize=True)
+        await asyncio.sleep(random.uniform(0.4, 0.8))
 
         # ── 5. Submit the form ────────────────────────────────────────────────
+        # Enable network logging so we can see the /api/login response
+        _login_responses: list[dict] = []
+        try:
+            await tab.enable_network_events()
+
+            async def _capture_login(event: dict) -> None:
+                url = event.get("response", {}).get("url", "") or event.get("url", "")
+                if "api/login" in url:
+                    status = event.get("response", {}).get("status", "?")
+                    _log.info("pydoll: /api/login response status=%s", status)
+                    _login_responses.append(event)
+
+            await tab.on("Network.responseReceived", _capture_login)
+        except Exception:
+            pass   # network event capture is best-effort
+
         _log.info("pydoll: submitting login form")
         submit_btn = None
         for _sel in ('button[type="submit"]',):
@@ -640,22 +790,60 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
                 _log.info("pydoll: still waiting for token (%ds)…", (attempt + 1) // 2)
 
         if not auth_token:
-            # Try to surface any error text shown on the page
-            err_result = await tab.execute_script(
-                "return (document.querySelector('[class*=\"error\"],"
-                "[class*=\"Error\"],[class*=\"alert\"]')?.textContent || '').trim()"
+            # ── Manual login fallback ─────────────────────────────────────────
+            # Automated login scored too low on reCAPTCHA v3.  Keep Chrome open
+            # and ask the user to log in themselves.  We'll read the token from
+            # localStorage once they're in.
+            diag = await tab.execute_script(
+                "return JSON.stringify({"
+                "  err: (document.querySelector('[class*=\"error\"],[class*=\"Error\"]"
+                ",[class*=\"message\"]')?.textContent || '').trim()"
+                "})"
             )
-            err_msg = (
-                err_result
-                .get("result", {})
-                .get("result", {})
-                .get("value", "")
-            )
-            detail = f" — page error: {err_msg!r}" if err_msg else ""
-            raise RuntimeError(
-                f"pydoll: login failed — no token in localStorage after 20 s{detail}. "
-                "reCAPTCHA may have scored the session too low, or credentials are wrong."
-            )
+            page_err = ""
+            try:
+                page_err = json.loads(
+                    diag.get("result", {}).get("result", {}).get("value", "{}")
+                ).get("err", "")
+            except Exception:
+                pass
+
+            print("\n" + "=" * 60)
+            print("  reCAPTCHA blocked automated login.")
+            if page_err:
+                print(f"  Page error: {page_err}")
+            print()
+            print("  Chrome is still open. Please:")
+            print("    1. Log in to EvilQuest in the Chrome window.")
+            print("    2. Wait for the game to load fully.")
+            print("    3. The bot will detect the token automatically.")
+            print("  (Waiting up to 120 seconds...)")
+            print("=" * 60 + "\n")
+
+            for _wait in range(240):    # 120 seconds
+                await asyncio.sleep(0.5)
+                result = await tab.execute_script(
+                    "return localStorage.getItem('projectrs_token')"
+                )
+                value = (
+                    result
+                    .get("result", {})
+                    .get("result", {})
+                    .get("value")
+                )
+                if value and isinstance(value, str) and len(value) > 10:
+                    auth_token = value
+                    _log.info("pydoll: manual login detected — token acquired")
+                    break
+                if _wait % 20 == 19:
+                    remaining = (240 - _wait - 1) // 2
+                    _log.info("pydoll: waiting for manual login (%ds remaining)…", remaining)
+
+            if not auth_token:
+                raise RuntimeError(
+                    "pydoll: login failed — no token appeared after manual login window. "
+                    "Check credentials and reCAPTCHA status."
+                )
 
         _log.info("pydoll: token acquired — registering device key…")
 
@@ -695,6 +883,13 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
         )
         if device_id:
             save_device_state(device_id, eq_cookie)
+
+    # Clean up the temporary Chrome profile we created (if any)
+    if _profile_dir:
+        shutil.rmtree(_profile_dir, ignore_errors=True)
+
+    # Persist auth state so the next run within 23 h can skip the browser login
+    save_auth_state(auth_token, device_id, cookie_str)
 
     _log.info("pydoll: browser login complete")
     return auth_token, device_id, cookie_str
