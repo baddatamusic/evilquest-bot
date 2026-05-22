@@ -1,4 +1,4 @@
-# EvilQuest Bot · v3.1
+# EvilQuest Bot · v4.0
 
 Automation bot for [EvilQuest](https://evilquest.net) supporting woodcutting and combat modes.  
 Fully implements the **evilquest-game-v2** WebSocket protocol including ECDH key exchange, per-session opcode remapping, and AES-256-GCM encrypted frames.
@@ -7,12 +7,13 @@ Fully implements the **evilquest-game-v2** WebSocket protocol including ECDH key
 
 ## Features
 
-- **Woodcutting mode** — chops trees near the default area, auto-sells logs to Robert when inventory is full (28 logs)
+- **Woodcutting mode** — chops trees near the default area, auto-sells logs to Robert when inventory is full (28 logs); walks to the tile *beside* each tree for guaranteed adjacency before every chop
 - **Combat mode** — finds and attacks cows, walks back to the combat area on death; first kill confirmed in **53 s** from spawn
 - **Sniff mode** — passive packet logger; play the game manually while the bot prints every decoded message (useful for reverse engineering)
+- **reCAPTCHA v3 bypass** — launches a visible Chrome window via pydoll CDP automation; the page's own JS handles reCAPTCHA scoring transparently; auth token cached for 23 h so Chrome only opens once per day
 - Automatic reconnect-safe login: fetches a server-issued device ID, registers a persistent ECDSA signing key, and negotiates a fresh session on every run
 - A\* pathfinder with wall, water-tile, and **height-based cliff blocking** (pre-computed from terrain height chunks); dynamic tile learning via `PATH_TRUNCATED` catches any missed edges
-- Jittered heartbeat (5.0–6.2 s) with `CLIENT_ACTIVITY` to pass behavioural checks
+- Jittered heartbeat (5.0–6.2 s) with `CLIENT_PING`; `CLIENT_POSITION_Y` loop reports ground Y-height every 0.5 s (mirrors `reportYToServer()` in `GameManager.js`)
 
 ---
 
@@ -22,13 +23,17 @@ Fully implements the **evilquest-game-v2** WebSocket protocol including ECDH key
 Python 3.11+
 cryptography
 requests
+pydoll-python>=2.0
 ```
 
 Install dependencies:
 
 ```bash
-pip install cryptography requests
+pip install cryptography requests pydoll-python
 ```
+
+Google Chrome must be installed at the default path (`C:\Program Files\Google\Chrome\Application\chrome.exe` on Windows).  
+Chrome is only launched on the first run of each day; subsequent runs within 23 h use the cached auth token and skip the browser entirely.
 
 Map assets (walls, tile chunks, height chunks) must be present under `gameassets/maps/kcmap/`.  
 Run `scrape_assets.py` once to download them if missing.
@@ -57,8 +62,14 @@ python bot.py --username YOUR_USER --password YOUR_PASS --sniff
 --cow-x / --cow-y  # cow area centre (x10 coords)
 ```
 
-Persistent state is stored in `~/.evilquest/` (device ID, ECDSA signing key).  
-On first run the bot generates the signing key and registers it with the server automatically.
+Credentials can also be provided via `.env` (same directory as `bot.py`):
+
+```
+EVILQUEST_USER=yourname
+EVILQUEST_PASSWORD=yourpass
+```
+
+Persistent state is stored in `~/.evilquest/` (device ID, ECDSA signing key, auth token cache).
 
 ---
 
@@ -66,6 +77,7 @@ On first run the bot generates the signing key and registers it with the server 
 
 | Version | Date | Summary |
 |---|---|---|
+| **4.0** | May 2026 | reCAPTCHA v3 bypass via pydoll Chrome CDP; 23 h auth token cache; protocol v3.2 (DUEL removed, CLIENT_POSITION_Y added); Chrome startup reliability fix; woodcutting stand-beside adjacency — **PATH_TRUNCATED eliminated, 2× log rate** |
 | **3.1** | May 2026 | Height-based cliff pre-computation (≥78 % of cliff tiles blocked at startup); on-path immediate blocking; Euclidean wait-time; `.env` credential loading — **first kill in 53 s, zero PATH_TRUNCATED events** |
 | **3.0** | May 2026 | Dynamic obstacle persistence; robust `_move()` position tracking; on-path/off-path PATH_TRUNCATED detection; A* tuning |
 | **2.0** | May 2026 | Full evilquest-game-v2 protocol rewrite (ECDH, AES-256-GCM, opcode remapping, signing key) |
@@ -74,6 +86,141 @@ On first run the bot generates the signing key and registers it with the server 
 ---
 
 ## Changelog
+
+---
+
+### v4.0 — reCAPTCHA bypass + protocol v3.2 + woodcutting reliability (May 2026)
+
+#### Summary
+
+EvilQuest added reCAPTCHA v3 to `/api/login`, breaking the direct HTTP login flow.  
+A game update removed the duel system and `CLIENT_ACTIVITY` opcode, adding `CLIENT_POSITION_Y` in their place.  
+Woodcutting was wasting one full `PLAYER_MOVE` → `PATH_TRUNCATED` roundtrip per chop because the bot was targeting the tree's own (impassable) tile.
+
+All three issues are fixed in v4.0.
+
+#### Verified results (woodcutting, 2-minute test)
+
+```
+19:10:50  Walking beside tree entity=10358 at (1170,1690) → standing at (1180,1690)
+19:10:51  SKILLING_START [10358, 31]
+19:10:54  XP_GAIN skill=7 xp=25
+...
+19:12:40  XP_GAIN skill=7 xp=25   ← 7+ logs chopped (mid-chop at cutoff)
+```
+
+- Zero `PATH_TRUNCATED` events during woodcutting (was 1 per chop)
+- ~8 logs / 2 min (was 4 before adjacency fix)
+
+---
+
+#### 4.1 reCAPTCHA v3 bypass (`ws_transport.py`)
+
+**Problem:** `/api/login` added reCAPTCHA v3 token validation. The bot's direct `requests` POST returned `400 Captcha score too low`.
+
+**Fix:** `async_http_login()` launches a visible Chrome window via pydoll-python (Chrome DevTools Protocol).  
+The page's own JS generates the reCAPTCHA token while the bot fills in credentials with human-like typing and mouse movement — no token extraction or third-party solver needed.
+
+| Step | What happens |
+|---|---|
+| Navigate `evilquest.net` (root) | Warms up reCAPTCHA session; 4–6 s dwell |
+| Navigate `evilquest.net/play` | Login form loads |
+| Human-like mouse movement | 5-point cursor path with jitter before touching the form |
+| `type_text(humanize=True)` | Randomised inter-keystroke delays |
+| "Remember username" checkbox | Ticked if present |
+| Wait for `localStorage["projectrs_token"]` | Up to 20 s polling |
+| Manual fallback | If automated login scores too low, Chrome stays open 120 s for manual login; token read from `localStorage` once the user logs in |
+
+After a successful login, the auth token, device ID, and session cookies are saved to `~/.evilquest/auth.json` with a 23 h TTL.  Subsequent runs hit the fast path and skip Chrome entirely.
+
+---
+
+#### 4.2 Auth token caching (`ws_transport.py`)
+
+| Function | Purpose |
+|---|---|
+| `save_auth_state(token, device_id, cookie)` | Writes `~/.evilquest/auth.json` with a `ts` timestamp |
+| `load_auth_state()` | Returns cached values if age < 23 h; returns `None` otherwise |
+
+`async_http_login()` checks the cache first and returns immediately if a fresh token is present.  
+The 23 h window (vs the server's 24 h token expiry) provides a 1 h safety margin.
+
+---
+
+#### 4.3 Chrome startup reliability (`ws_transport.py`)
+
+Two startup failures were discovered and fixed during development:
+
+**Bug 1 — Partial `--user-data-dir` profile blocked Chrome's CDP port**
+
+The bot was copying `User Data/Local State` + `Default/Network/Cookies` into a temp directory and passing it as `--user-data-dir`.  
+Chrome requires a `Default/Preferences` file to initialise the profile; without it, Chrome hangs during startup and never exposes the CDP debugging port (observed: 30 s timeout with no connection).
+
+Fix: removed the profile copy entirely. pydoll creates a clean, isolated temp directory per launch.
+
+**Bug 2 — Unsupported Chrome flags showed warning banners**
+
+`--disable-blink-features=AutomationControlled`, `--disable-infobars`, and `--no-sandbox` all produce a "You are using an unsupported command-line flag" banner in modern Chrome (120+).  
+These banners modify the browser's visual state and degrade reCAPTCHA v3 trust scoring.
+
+Fix: all three flags removed. Added `--disable-sync` (prevents Google sign-in prompt on fresh profile) and `--disable-extensions` (faster startup). `start_timeout` raised from 10 s to 30 s.
+
+---
+
+#### 4.4 Protocol v3.2 — duel system removed, `CLIENT_POSITION_Y` added
+
+A game update removed the duel system and `CLIENT_ACTIVITY` opcode from the server's accepted opcode set.
+
+**Opcodes removed from `_CLIENT_LOGICAL`:**
+
+| Opcode | Name |
+|---|---|
+| 100–105 | `DUEL_REQUEST` / `DUEL_ACCEPT_REQUEST` / `DUEL_DECLINE` / `DUEL_STAKE_ITEM` / `DUEL_REMOVE_STAKE` / `DUEL_ACCEPT` |
+| 121 | `CLIENT_ACTIVITY` — entirely removed from game client; sending it raises `ValueError: Missing client opcode mapping for logical 121` |
+
+**Opcodes removed from `_SERVER_LOGICAL`:**
+
+| Opcodes | Names |
+|---|---|
+| 96–99, 101–103 | All duel server opcodes (`DUEL_REQUEST_RECEIVED`, `DUEL_OPEN`, `DUEL_STAKE_UPDATE`, `DUEL_ACCEPT_STATE`, `DUEL_CLOSE`, `DUEL_START`, `DUEL_FINISH`) |
+
+**New: `CLIENT_POSITION_Y` (opcode 71)**
+
+`_position_y_loop()` in `bot.py` runs every 0.5 s and mirrors `reportYToServer()` / `updateIndoorDetection()` from `GameManager.js`:
+
+- Only sends when `abs(height − lastSentY) ≥ 0.05` world units
+- Packet format: `pack(C.CLIENT_POSITION_Y, round(height * 10))`
+- Height source: `pathfinder._heights[(tile_x, tile_z)]` (float, world-unit Y)
+- Initial height from `LOGIN_OK vals[3] / 10.0`
+
+---
+
+#### 4.5 Woodcutting adjacency — `_stand_beside()` + `arrive_window` (`bot.py`)
+
+**Problem 1 — Interact packets silently ignored (~50 % of attempts)**
+
+`PLAYER_INTERACT_OBJECT` was being sent while the player was up to 2.5 tiles from the tree (`ARRIVE_WINDOW = 25` x10 units).  The server requires the player to be within ~1–2 tiles to accept the interaction.
+
+Fix: added `arrive_window: int = ARRIVE_WINDOW` parameter to `_move()`.  `_chop_tree()` now passes `arrive_window=12` (≈1.2 tiles) for the tree-approach step, guaranteeing adjacency before every interact packet.
+
+**Problem 2 — `PATH_TRUNCATED` roundtrip on every chop**
+
+Trees occupy their own tile.  Sending `PLAYER_MOVE` to the tree's exact coordinates `(tx, ty)` always triggers a `PATH_TRUNCATED` back to the player's current position — a wasted network roundtrip on every single chop.
+
+Fix: `_stand_beside(player_x, player_y, obj_x, obj_y)` computes the four orthogonal neighbours of the tree tile and returns whichever is closest to the player.  `_chop_tree()` walks to this adjacent tile instead of the tree tile itself.
+
+```
+Before:  PLAYER_MOVE(1170,1690) → PATH_TRUNCATED(1185,1695) → re-send interact
+After:   PLAYER_MOVE(1180,1690) → arrives clean → interact immediately
+```
+
+**`_chop_tree()` new flow:**
+
+1. Coarse move to tree area (loose `ARRIVE_WINDOW`)
+2. Re-scan `state.objects` for nearest live tree entity
+3. Compute `_stand_beside()` neighbour tile
+4. Fine move to neighbour tile (`arrive_window=12`)
+5. Send `PLAYER_INTERACT_OBJECT(eid, 0)`
 
 ---
 
@@ -404,6 +551,7 @@ gameassets/
   device.json           — cached server device ID + eq_device_id cookie
   signing_key.json      — persistent ECDSA P-256 private key (JWK)
   dynamic_blocks.json   — tile coords learned as impassable via PATH_TRUNCATED (survives restarts)
+  auth.json             — cached auth token + device ID + cookies (23 h TTL; skips Chrome on re-runs)
 ```
 
 ---
