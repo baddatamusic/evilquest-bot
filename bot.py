@@ -189,6 +189,10 @@ class Bot:
         self._sell_lock  = asyncio.Lock()
 
         self.ev_path_truncated = asyncio.Event()
+        # Set by _recv_loop() when the socket closes unexpectedly.
+        # _send() checks this before touching the socket; all wait loops
+        # check it so they abort immediately instead of timing out.
+        self._ws_closed  = asyncio.Event()
 
     # ── Network ──────────────────────────────────────────────────────────────
 
@@ -200,6 +204,8 @@ class Bot:
         return token, device_id, cookie
 
     async def _send(self, data: bytes):
+        if self._ws_closed.is_set():
+            raise ConnectionError("WebSocket is closed — cannot send")
         await self.ws.send(data)
 
     # ── Message dispatch ─────────────────────────────────────────────────────
@@ -391,6 +397,9 @@ class Bot:
                 self.state._pending_map_ready = False
                 await self.ws.send(pack(C.MAP_READY))
                 log.info("MAP_READY sent")
+        # Signal all blocked waits so they raise ConnectionError immediately
+        # instead of hanging until their own timeouts expire.
+        self._ws_closed.set()
 
     # ── Movement ─────────────────────────────────────────────────────────────
 
@@ -465,6 +474,8 @@ class Bot:
         dynamic_blocks = 0  # consecutive truncations at same tile
 
         while loop.time() < deadline:
+            if self._ws_closed.is_set():
+                raise ConnectionError("WebSocket closed during movement")
             remaining = t_arrive - loop.time()
             if remaining <= 0:
                 break   # estimated travel time elapsed → assume arrived
@@ -572,6 +583,27 @@ class Bot:
             log.info(f"Movement done ({steps_walked} steps ≈ {steps_walked / WALK_TILES_PER_SEC:.1f}s), assuming at ({cur_x},{cur_y})")
             self.state.x, self.state.y = cur_x, cur_y
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    async def _wait_for_event(self, event: asyncio.Event, timeout: float) -> bool:
+        """
+        Wait up to `timeout` seconds for `event` to be set.
+        Returns True if the event fired, False on timeout.
+        Raises ConnectionError immediately if the WebSocket closes while waiting.
+        """
+        event_task  = asyncio.create_task(event.wait())
+        closed_task = asyncio.create_task(self._ws_closed.wait())
+        done, pending = await asyncio.wait(
+            {event_task, closed_task},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        if self._ws_closed.is_set():
+            raise ConnectionError("WebSocket closed while waiting for event")
+        return event_task in done
+
     # ── Woodcutting ───────────────────────────────────────────────────────────
 
     @staticmethod
@@ -631,15 +663,11 @@ class Bot:
         # action_index 0 = first interaction option (e.g. "Chop" for trees)
         await self._send(pack(C.PLAYER_INTERACT_OBJECT, eid, 0))
 
-        try:
-            await asyncio.wait_for(self.state.ev_skilling_start.wait(), timeout=6.0)
-        except asyncio.TimeoutError:
+        if not await self._wait_for_event(self.state.ev_skilling_start, 6.0):
             log.warning("No SKILLING_START")
             return False
 
-        try:
-            await asyncio.wait_for(self.state.ev_skilling_stop.wait(), timeout=120.0)
-        except asyncio.TimeoutError:
+        if not await self._wait_for_event(self.state.ev_skilling_stop, 120.0):
             log.warning("No SKILLING_STOP in 2 minutes")
             return False
 
@@ -670,9 +698,7 @@ class Bot:
         self.state.ev_shop_open.clear()
         await self._send(pack(C.PLAYER_TALK_NPC, eid))
 
-        try:
-            await asyncio.wait_for(self.state.ev_dialogue.wait(), timeout=6.0)
-        except asyncio.TimeoutError:
+        if not await self._wait_for_event(self.state.ev_dialogue, 6.0):
             log.warning("No DIALOGUE_OPEN after talking to Robert")
             return
 
@@ -681,10 +707,9 @@ class Bot:
         log.info(f"DIALOGUE_CHOOSE npc={eid} session={sid} option={self.shop_option}")
         await self._send(pack(C.DIALOGUE_CHOOSE, eid, sid, self.shop_option))
 
-        try:
-            await asyncio.wait_for(self.state.ev_shop_open.wait(), timeout=5.0)
+        if await self._wait_for_event(self.state.ev_shop_open, 5.0):
             log.info("SHOP_OPEN received — selling now")
-        except asyncio.TimeoutError:
+        else:
             log.warning("No SHOP_OPEN after DIALOGUE_CHOOSE — selling anyway")
 
         await asyncio.sleep(0.3)
@@ -761,6 +786,8 @@ class Bot:
             player_dead = False
 
             while asyncio.get_event_loop().time() < deadline:
+                if self._ws_closed.is_set():
+                    raise ConnectionError("WebSocket closed during combat")
                 if self.state.ev_player_died.is_set():
                     player_dead = True
                     break
@@ -775,9 +802,7 @@ class Bot:
 
             if player_dead:
                 log.info("Died — waiting for respawn...")
-                try:
-                    await asyncio.wait_for(self.state.ev_player_respawned.wait(), timeout=30.0)
-                except asyncio.TimeoutError:
+                if not await self._wait_for_event(self.state.ev_player_respawned, 30.0):
                     log.warning("Respawn timed out — continuing anyway")
                 await asyncio.sleep(1.0)
                 wx = self.cow_x + random.randint(-80, 80)
@@ -861,44 +886,84 @@ class Bot:
 
         self._token, self._device_id, self._device_cookie = await self._http_login()
 
-        ws = GameWebSocket(self._token, self._device_id, self._device_cookie)
-        await ws.connect()   # performs CRYPTO_CHALLENGE/RESPONSE + OPCODE_MAPPING
-        self.ws = ws
-        log.info("WebSocket connected + crypto handshake complete")
+        MAX_RECONNECTS = 5
+        reconnect_count = 0
 
-        recv      = asyncio.create_task(self._recv_loop())
-        heartbeat = asyncio.create_task(self._heartbeat_loop())
-        pos_y     = asyncio.create_task(self._position_y_loop())
+        while True:
+            # ── Connect ──────────────────────────────────────────────────────
+            ws = GameWebSocket(self._token, self._device_id, self._device_cookie)
+            await ws.connect()   # performs CRYPTO_CHALLENGE/RESPONSE + OPCODE_MAPPING
+            self.ws = ws
+            self._ws_closed.clear()
+            log.info("WebSocket connected + crypto handshake complete")
 
-        try:
-            await asyncio.wait_for(self.state.ev_login_ok.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            raise RuntimeError("No LOGIN_OK within 10 s")
+            recv      = asyncio.create_task(self._recv_loop())
+            heartbeat = asyncio.create_task(self._heartbeat_loop())
+            pos_y     = asyncio.create_task(self._position_y_loop())
 
-        await asyncio.sleep(random.uniform(3.0, 5.0))
-        log.info(
-            f"Ready — mode={mode} pos=({self.state.x},{self.state.y}) "
-            f"trees={len(self.state.nearby_trees())} npcs={len(self.state.npcs)}"
-        )
-
-        if mode == "woodcutting":
-            watchdog = asyncio.create_task(self._inventory_watchdog())
             try:
-                await self._woodcutting_loop()
+                await asyncio.wait_for(self.state.ev_login_ok.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                raise RuntimeError("No LOGIN_OK within 10 s")
+
+            # Shorter delay on reconnects (state already known from first login)
+            await asyncio.sleep(random.uniform(3.0, 5.0) if reconnect_count == 0 else 1.0)
+            log.info(
+                f"Ready — mode={mode} pos=({self.state.x},{self.state.y}) "
+                f"trees={len(self.state.nearby_trees())} npcs={len(self.state.npcs)}"
+            )
+
+            # ── Bot loop ─────────────────────────────────────────────────────
+            disconnected = False
+            try:
+                if mode == "woodcutting":
+                    watchdog = asyncio.create_task(self._inventory_watchdog())
+                    try:
+                        await self._woodcutting_loop()
+                    finally:
+                        watchdog.cancel()
+                else:
+                    await self._combat_loop()
+            except ConnectionError as exc:
+                # Clean disconnect or socket reset — try to reconnect
+                log.warning(f"Connection lost: {exc} — will attempt reconnect")
+                disconnected = True
+            except OSError as exc:
+                # TLS/SSL errors (ssl.SSLEOFError etc.) are OSError subclasses
+                log.warning(f"Connection lost (OS/TLS error): {exc} — will attempt reconnect")
+                disconnected = True
             finally:
                 recv.cancel()
-                watchdog.cancel()
-                heartbeat.cancel()
-                pos_y.cancel()
-        else:
-            try:
-                await self._combat_loop()
-            finally:
-                recv.cancel()
                 heartbeat.cancel()
                 pos_y.cancel()
 
-        await ws.close()
+            await ws.close()
+
+            if not disconnected:
+                break   # normal exit (stopped by user or bot logic finished)
+
+            if reconnect_count >= MAX_RECONNECTS:
+                log.error(f"Max reconnects ({MAX_RECONNECTS}) reached — giving up")
+                break
+
+            reconnect_count += 1
+            delay = min(30, 5 * reconnect_count)
+            log.info(
+                f"Reconnecting in {delay}s "
+                f"(attempt {reconnect_count}/{MAX_RECONNECTS})…"
+            )
+            await asyncio.sleep(delay)
+
+            # Reset per-connection state; keep game state (npcs, objects, position)
+            self.state.ev_login_ok.clear()
+            self._ws_closed.clear()
+
+            # Refresh token from cache (opens browser only if cached token expired)
+            try:
+                self._token, self._device_id, self._device_cookie = await self._http_login()
+            except Exception as exc:
+                log.error(f"Re-login failed: {exc}")
+                break
 
     async def sniff(self):
         self._token, self._device_id, self._device_cookie = await self._http_login()
