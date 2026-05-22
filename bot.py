@@ -404,7 +404,8 @@ class Bot:
             args.extend([wx, wz])
         return pack(C.PLAYER_MOVE, *args)
 
-    async def _move(self, x: int, y: int, timeout: float | None = None):
+    async def _move(self, x: int, y: int, timeout: float | None = None,
+                    arrive_window: int = ARRIVE_WINDOW):
         """
         Move to (x, y) in x10 coordinates.
 
@@ -423,7 +424,7 @@ class Bot:
         • On timeout, update state.x/y to cur_x/cur_y (last confirmed position
           from PATH_TRUNCATED feedback) rather than assuming the destination.
         """
-        if abs(self.state.x - x) <= ARRIVE_WINDOW and abs(self.state.y - y) <= ARRIVE_WINDOW:
+        if abs(self.state.x - x) <= arrive_window and abs(self.state.y - y) <= arrive_window:
             return
 
         log.info(f"Moving to ({x},{y}), currently at ({self.state.x},{self.state.y})")
@@ -573,29 +574,58 @@ class Bot:
 
     # ── Woodcutting ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _stand_beside(player_x: int, player_y: int,
+                      obj_x: int, obj_y: int) -> tuple[int, int]:
+        """
+        Return the orthogonal tile (x10 coords) adjacent to (obj_x, obj_y)
+        that is nearest to (player_x, player_y).
+
+        Trees occupy their own tile — sending PLAYER_MOVE to the tree's exact
+        tile causes a PATH_TRUNCATED roundtrip every time.  Walking to an
+        adjacent tile instead avoids that wasted exchange entirely.
+        """
+        candidates = [
+            (obj_x + 10, obj_y),
+            (obj_x - 10, obj_y),
+            (obj_x,      obj_y + 10),
+            (obj_x,      obj_y - 10),
+        ]
+        return min(candidates,
+                   key=lambda c: abs(c[0] - player_x) + abs(c[1] - player_y))
+
     async def _chop_tree(self) -> bool:
-        # Decide where to move first
+        # ── Step 1: coarse move to the tree area ─────────────────────────────
         trees = self.state.nearby_trees()
         if trees:
-            _, _, tx, ty = trees[0]
+            _, _, ax, ay = trees[0]
         else:
-            tx, ty = self.tree_x, self.tree_y
-            log.info(f"No trees visible yet — moving to tree area ({tx},{ty})")
+            ax, ay = self.tree_x, self.tree_y
+            log.info(f"No trees visible yet — moving to tree area ({ax},{ay})")
 
-        self.state.ev_skilling_start.clear()
-        self.state.ev_skilling_stop.clear()
+        await self._move(ax, ay)
+        await asyncio.sleep(0.5)   # let WORLD_OBJECT_SYNC packets arrive
 
-        await self._move(tx, ty)
-        await asyncio.sleep(0.5)   # let WORLD_OBJECT_SYNC packets arrive for the new area
-
-        # Re-scan after arriving — trees in the area should now be in state.objects
+        # ── Step 2: pick the closest visible tree after arriving ──────────────
         trees = self.state.nearby_trees()
         if trees:
             eid, _, tx, ty = trees[0]
-            log.info(f"Chopping tree entity={eid} at ({tx},{ty})")
         else:
             eid, tx, ty = self.tree_entity, self.tree_x, self.tree_y
             log.warning(f"No trees in sync after move, using default entity={eid} at ({tx},{ty})")
+
+        # ── Step 3: walk to the tile beside the tree, not the tree itself ─────
+        # Trees occupy their own tile so PLAYER_MOVE to (tx, ty) is always
+        # PATH_TRUNCATED back to our current position — a wasted roundtrip.
+        # Pick the nearest orthogonal neighbour instead.
+        sx, sy = self._stand_beside(self.state.x, self.state.y, tx, ty)
+        log.info(f"Walking beside tree entity={eid} at ({tx},{ty}) → standing at ({sx},{sy})")
+        await self._move(sx, sy, arrive_window=12)
+        await asyncio.sleep(0.2)
+
+        # ── Step 4: send the interact packet ─────────────────────────────────
+        self.state.ev_skilling_start.clear()
+        self.state.ev_skilling_stop.clear()
 
         # PLAYER_INTERACT_OBJECT format: (entity_id, action_index)
         # action_index 0 = first interaction option (e.g. "Chop" for trees)

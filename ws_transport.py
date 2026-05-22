@@ -605,18 +605,18 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
 
     options = ChromiumOptions()
     # Do NOT use --headless=new: reCAPTCHA v3 scores headless sessions too low.
-    # Do NOT use --no-sandbox: shows a security banner that makes the browser
-    # look suspicious and is only needed on Linux in a container.
+    # Do NOT use --no-sandbox: shows a security banner that degrades reCAPTCHA.
+    # Do NOT use --disable-blink-features=AutomationControlled: unsupported flag
+    #   on modern Chrome; shows a warning banner and does not help reCAPTCHA.
+    # Do NOT use --disable-infobars: same — unsupported and triggers a banner.
+    # Do NOT pass --user-data-dir pointing to a partial profile copy — Chrome hangs
+    #   on startup when Default/Preferences is missing, blocking CDP for 30+ s.
+    #   Let pydoll create a clean temp dir so Chrome starts reliably every time.
     options.add_argument("--window-size=1280,800")
     options.add_argument("--window-position=0,0")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--disable-infobars")
-
-    # Copy the user's real Chrome cookies into a temp profile so reCAPTCHA v3
-    # can use the Google auth cookies for a higher trust score.
-    _profile_dir: str | None = _prepare_chrome_profile()
-    if _profile_dir:
-        options.add_argument(f"--user-data-dir={_profile_dir}")
+    options.add_argument("--disable-sync")          # skip Google account sync prompt
+    options.add_argument("--disable-extensions")   # faster startup, no extension noise
+    options.start_timeout = 30   # seconds to wait for CDP port (default is 10)
 
     # Use the system-installed Chrome on Windows
     _chrome_win = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -635,7 +635,7 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
         # a higher trust score.
         _log.info("pydoll: navigating to evilquest.net (root)")
         await tab.go_to("https://evilquest.net")
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(random.uniform(4.0, 6.0))
 
         _log.info("pydoll: navigating to evilquest.net/play")
         await tab.go_to("https://evilquest.net/play")
@@ -726,6 +726,18 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
 
         await pass_field.type_text(password, humanize=True)
         await asyncio.sleep(random.uniform(0.4, 0.8))
+
+        # ── 4b. Tick "Remember username on this device" if present ───────────
+        remember_box = await tab.query('input[type="checkbox"]', timeout=2, raise_exc=False)
+        if remember_box:
+            try:
+                await remember_box.click()
+                _log.info("pydoll: checked 'Remember username' checkbox")
+                await asyncio.sleep(random.uniform(0.2, 0.4))
+            except Exception as exc:
+                _log.debug("pydoll: checkbox click failed (%s) — continuing", exc)
+        else:
+            _log.debug("pydoll: no checkbox found on page")
 
         # ── 5. Submit the form ────────────────────────────────────────────────
         # Enable network logging so we can see the /api/login response
@@ -883,10 +895,6 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
         )
         if device_id:
             save_device_state(device_id, eq_cookie)
-
-    # Clean up the temporary Chrome profile we created (if any)
-    if _profile_dir:
-        shutil.rmtree(_profile_dir, ignore_errors=True)
 
     # Persist auth state so the next run within 23 h can skip the browser login
     save_auth_state(auth_token, device_id, cookie_str)
