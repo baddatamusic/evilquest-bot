@@ -1,5 +1,5 @@
 """
-EvilBot V3 by Blackberry — GUI for the EvilQuest automated bot.
+EvilBot V4 by Blackberry — GUI for the EvilQuest automated bot.
 """
 
 import os
@@ -66,7 +66,6 @@ C_STONE   = "#18181f"
 # ── Image helpers ─────────────────────────────────────────────────────────────
 
 def _tile_stone(w: int, h: int, darken: int = 140) -> ImageTk.PhotoImage:
-    """Tile the stone-dark texture and apply a dark overlay."""
     stone = Image.open(_res("gameassets/ui/stone-dark.png")).convert("RGBA")
     tile  = stone.resize((300, 300), Image.LANCZOS)
     bg    = Image.new("RGBA", (w, h))
@@ -88,25 +87,6 @@ def _load_sprite(filename: str, size: int) -> ImageTk.PhotoImage | None:
         return ImageTk.PhotoImage(bg)
     except Exception:
         return None
-
-
-def _make_btn_img(w: int, h: int, color_hex: str,
-                  hover_hex: str | None = None) -> tuple:
-    """Return (normal_img, hover_img) for a styled button."""
-    def _draw(col: str) -> ImageTk.PhotoImage:
-        img  = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        r    = int(col[1:3], 16)
-        g    = int(col[3:5], 16)
-        b    = int(col[5:7], 16)
-        draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=5,
-                                fill=(r, g, b, 240),
-                                outline=(min(r + 60, 255),
-                                         min(g + 60, 255),
-                                         min(b + 60, 255), 255),
-                                width=1)
-        return ImageTk.PhotoImage(img.convert("RGB"))
-    return _draw(color_hex), _draw(hover_hex or color_hex)
 
 
 # ── Queue logging handler ─────────────────────────────────────────────────────
@@ -138,7 +118,7 @@ SKILL_NAMES = {0: "Attack", 1: "Strength", 2: "Defence",
 class EvilBotApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("EvilBot V3 by Blackberry")
+        self.root.title("EvilBot V4 by Blackberry")
         self.root.configure(bg=C_BG)
         self.root.resizable(False, False)
 
@@ -152,7 +132,7 @@ class EvilBotApp:
         self._mode         = "woodcutting"
         self._handler:     _QueueHandler | None         = None
 
-        # Live stats (updated by parsing log lines)
+        # Live stats
         self._kills   = 0
         self._chops   = 0
         self._xp:     dict[int, int] = {}
@@ -172,14 +152,13 @@ class EvilBotApp:
         self.root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
 
     def _keep(self, img):
-        """Prevent a PhotoImage from being garbage-collected."""
         self._images.append(img)
         return img
 
     # ── Login screen ──────────────────────────────────────────────────────────
 
     def _build_login(self):
-        W, H = 460, 520
+        W, H = 460, 560
         self._center(W, H)
 
         canvas = tk.Canvas(self.root, width=W, height=H,
@@ -193,19 +172,20 @@ class EvilBotApp:
         except Exception:
             canvas.configure(bg=C_STONE)
 
-        # Dark card
         cx, cy = W // 2, H // 2
         pad = 30
         cw, ch = W - pad * 2, H - pad * 2
+
+        # Dark card
         canvas.create_rectangle(cx - cw // 2, cy - ch // 2,
                                  cx + cw // 2, cy + ch // 2,
                                  fill="#0c0c1a", outline=C_BORDER, width=2)
-        # Gold accent line at top of card
+        # Gold accent line at top
         canvas.create_line(cx - cw // 2 + 12, cy - ch // 2 + 3,
                             cx + cw // 2 - 12, cy - ch // 2 + 3,
                             fill=C_GOLD, width=2)
 
-        # Sprite — helm or axe
+        # Sprite
         sprite = (_load_sprite("helm base.png", 48)
                   or _load_sprite("axe base.png", 48))
         if sprite:
@@ -214,28 +194,25 @@ class EvilBotApp:
                                  image=sprite)
 
         # Title
-        canvas.create_text(cx, cy - ch // 2 + 80,
-                            text="EvilBot V3",
+        canvas.create_text(cx, cy - ch // 2 + 82,
+                            text="EvilBot V4",
                             font=("Segoe UI", 26, "bold"),
                             fill=C_GOLD)
-        canvas.create_text(cx, cy - ch // 2 + 108,
+        canvas.create_text(cx, cy - ch // 2 + 110,
                             text="by Blackberry",
                             font=("Segoe UI", 10),
                             fill=C_DIM)
-        # Thin separator
-        sep_y = cy - ch // 2 + 124
+        sep_y = cy - ch // 2 + 126
         canvas.create_line(cx - 80, sep_y, cx + 80, sep_y,
                             fill=C_BORDER, width=1)
 
-        # ── Form widgets embedded in canvas ──────────────────────────────────
+        # ── Form widgets ─────────────────────────────────────────────────────
         form_y = sep_y + 20
         row_h  = 54
 
         def make_label(text, y):
-            canvas.create_text(cx - cw // 2 + 24, y,
-                                text=text, anchor="w",
-                                font=("Segoe UI", 9),
-                                fill=C_DIM)
+            canvas.create_text(cx - cw // 2 + 24, y, text=text, anchor="w",
+                                font=("Segoe UI", 9), fill=C_DIM)
 
         def make_entry(y, show=None):
             var = tk.StringVar()
@@ -277,17 +254,21 @@ class EvilBotApp:
                          bordercolor=C_BORDER, arrowcolor=C_GOLD)
         canvas.create_window(cx, form_y + row_h * 2 + 26, window=mode_combo)
 
-        # Error label
-        self._err_var = tk.StringVar()
-        err_lbl = tk.Label(canvas, textvariable=self._err_var,
-                           font=("Segoe UI", 9), bg="#0c0c1a", fg=C_RED)
-        canvas.create_window(cx, form_y + row_h * 3 + 10, window=err_lbl)
+        # Status / error label (used for both errors and Chrome progress)
+        self._login_status_var = tk.StringVar()
+        self._login_status_lbl = tk.Label(
+            canvas, textvariable=self._login_status_var,
+            font=("Segoe UI", 9), bg="#0c0c1a", fg=C_RED,
+            wraplength=cw - 40,
+        )
+        canvas.create_window(cx, form_y + row_h * 3 + 14,
+                              window=self._login_status_lbl)
 
         # Login button
-        btn_y = form_y + row_h * 3 + 32
+        btn_y = form_y + row_h * 3 + 44
         self._login_btn = tk.Button(
             canvas,
-            text="▶  Login & Start Bot",
+            text="▶  Login",
             font=("Segoe UI", 11, "bold"),
             bg=C_GOLD, fg="#0a0a14",
             activebackground=C_GOLD2, activeforeground="#0a0a14",
@@ -302,116 +283,184 @@ class EvilBotApp:
         self._uent.focus()
         self._canvas_login = canvas
 
-        # Pre-fill credentials from .env / environment if available
+        # Pre-fill from .env
         env_user = os.environ.get("EVILQUEST_USER", "")
         env_pass = os.environ.get("EVILQUEST_PASSWORD", "")
         if env_user:
             self._uvar.set(env_user)
         if env_pass:
             self._pvar.set(env_pass)
-        # If both are pre-filled, move focus to the mode selector
         if env_user and env_pass:
             mode_combo.focus()
+
+    def _set_login_status(self, text: str, color: str = C_RED):
+        self._login_status_var.set(text)
+        self._login_status_lbl.configure(fg=color)
+        self.root.update_idletasks()
 
     def _on_login(self):
         u = self._uvar.get().strip()
         p = self._pvar.get().strip()
         if not u or not p:
-            self._err_var.set("Enter username and password.")
+            self._set_login_status("Enter username and password.", C_RED)
             return
-        self._err_var.set("")
-        self._login_btn.configure(state="disabled", text="Connecting…")
-        self.root.update_idletasks()
+
         self._username = u
         self._password = p
         self._mode     = self._mode_var.get().lower()
+
+        self._login_btn.configure(state="disabled", text="Connecting…")
+        self._set_login_status("", C_DIM)
+
+        # Check for cached token — if found, skip Chrome entirely
+        try:
+            from ws_transport import load_auth_state
+            cached = load_auth_state()
+        except Exception:
+            cached = None
+
+        if cached:
+            self._set_login_status("✓ Cached token found — no Chrome needed", C_GREEN)
+            self.root.after(600, self._finish_login)
+        else:
+            self._set_login_status(
+                "Opening Chrome for reCAPTCHA login…\n"
+                "Complete login in the browser if prompted.",
+                C_CYAN,
+            )
+            threading.Thread(target=self._login_thread, daemon=True).start()
+
+    def _login_thread(self):
+        """Run async_http_login in a background thread with its own event loop."""
+        import ws_transport as wt
+
+        # Route ws_transport INFO logs into the status label during login
+        class _StatusHandler(logging.Handler):
+            def __init__(self_, cb):
+                super().__init__()
+                self_._cb = cb
+            def emit(self_, record):
+                msg = record.getMessage()
+                # Only surface user-relevant lines
+                for kw in ("navigating", "filling", "waiting for auth",
+                            "manual login", "token acquired", "device-key",
+                            "captcha", "reusing cached"):
+                    if kw in msg.lower():
+                        self.root.after(0, lambda m=msg: self._set_login_status(
+                            m[:100], C_CYAN))
+                        break
+
+        sh = _StatusHandler(None)
+        wt_log = logging.getLogger("ws_transport")
+        wt_log.addHandler(sh)
+
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(wt.async_http_login(self._username, self._password))
+            loop.close()
+            self.root.after(0, self._finish_login)
+        except Exception as exc:
+            self.root.after(0, lambda e=exc: self._on_login_error(str(e)))
+        finally:
+            wt_log.removeHandler(sh)
+
+    def _on_login_error(self, msg: str):
+        self._login_btn.configure(state="normal", text="▶  Login")
+        self._set_login_status(f"Login failed: {msg[:120]}", C_RED)
+
+    def _finish_login(self):
         self._canvas_login.destroy()
         self._images.clear()
         self._build_console()
-        self._launch_bot()
 
     # ── Console screen ────────────────────────────────────────────────────────
 
     def _build_console(self):
         self.root.resizable(True, True)
-        self._center(920, 620)
+        self._center(960, 640)
 
         # ── Header bar ───────────────────────────────────────────────────────
         hdr = tk.Frame(self.root, bg=C_HEADER, pady=0)
         hdr.pack(fill="x", side="top")
 
-        # Mode sprite
         sprite_file = ("axe base.png" if self._mode == "woodcutting"
                        else "chainmail.png")
         spr = _load_sprite(sprite_file, 28)
         if spr:
             self._keep(spr)
-            tk.Label(hdr, image=spr, bg=C_HEADER).pack(side="left", padx=(10, 4), pady=6)
+            tk.Label(hdr, image=spr, bg=C_HEADER).pack(side="left",
+                                                        padx=(10, 4), pady=6)
 
-        # Title
-        tk.Label(hdr, text="EvilBot V3",
+        tk.Label(hdr, text="EvilBot V4",
                  font=("Segoe UI", 13, "bold"),
-                 bg=C_HEADER, fg=C_GOLD).pack(side="left", padx=(0, 6))
+                 bg=C_HEADER, fg=C_GOLD).pack(side="left", padx=(0, 4))
+        tk.Label(hdr, text="by Blackberry",
+                 font=("Segoe UI", 9),
+                 bg=C_HEADER, fg=C_DIM).pack(side="left", padx=(0, 8))
 
-        # Separator
         tk.Label(hdr, text="|", font=("Segoe UI", 11),
                  bg=C_HEADER, fg=C_BORDER).pack(side="left")
 
-        # Player info
         tk.Label(hdr, text=f"  ● {self._username}",
                  font=("Segoe UI", 9, "bold"),
                  bg=C_HEADER, fg=C_GREEN).pack(side="left")
 
-        mode_label = self._mode.capitalize()
         mode_color = C_CYAN if self._mode == "woodcutting" else C_ORANGE
-        tk.Label(hdr, text=f"  {mode_label}",
+        tk.Label(hdr, text=f"  {self._mode.capitalize()}",
                  font=("Segoe UI", 9),
                  bg=C_HEADER, fg=mode_color).pack(side="left")
 
-        # Buttons — right side
-        self._stop_btn = tk.Button(
-            hdr, text="■  Stop",
-            font=("Segoe UI", 9, "bold"),
-            bg=C_RED, fg="white",
-            activebackground="#b03030", activeforeground="white",
-            relief="flat", bd=0, padx=14, pady=5,
-            cursor="hand2", command=self._on_stop,
-        )
-        self._stop_btn.pack(side="right", padx=(4, 10), pady=6)
-
-        self._start_btn = tk.Button(
-            hdr, text="▶  Start",
-            font=("Segoe UI", 9, "bold"),
-            bg=C_DIM, fg="white",
-            activebackground="#2a6a2a", activeforeground="white",
-            relief="flat", bd=0, padx=14, pady=5,
-            cursor="hand2", command=self._on_restart,
-            state="disabled",
-        )
-        self._start_btn.pack(side="right", padx=(0, 4), pady=6)
-
-        # Thin gold accent under header
-        sep = tk.Frame(self.root, bg=C_GOLD, height=1)
-        sep.pack(fill="x")
+        # Gold accent line under header
+        tk.Frame(self.root, bg=C_GOLD, height=1).pack(fill="x")
 
         # ── Body ─────────────────────────────────────────────────────────────
         body = tk.Frame(self.root, bg=C_BG)
         body.pack(fill="both", expand=True)
 
-        # ── Stats sidebar (fixed 160px) ───────────────────────────────────────
-        sidebar = tk.Frame(body, bg=C_PANEL, width=160)
+        # ── Stats + controls sidebar ─────────────────────────────────────────
+        sidebar = tk.Frame(body, bg=C_PANEL, width=170)
         sidebar.pack(side="right", fill="y")
         sidebar.pack_propagate(False)
 
         tk.Frame(sidebar, bg=C_GOLD, height=1).pack(fill="x")
 
+        # ── Start / Stop buttons ─────────────────────────────────────────────
+        btn_frame = tk.Frame(sidebar, bg=C_PANEL)
+        btn_frame.pack(fill="x", padx=10, pady=(12, 6))
+
+        self._start_btn = tk.Button(
+            btn_frame,
+            text="▶  Start Bot",
+            font=("Segoe UI", 10, "bold"),
+            bg="#285028", fg="white",
+            activebackground="#3a703a", activeforeground="white",
+            relief="flat", bd=0, padx=10, pady=8,
+            cursor="hand2", command=self._on_start,
+        )
+        self._start_btn.pack(fill="x", pady=(0, 4))
+
+        self._stop_btn = tk.Button(
+            btn_frame,
+            text="■  Stop Bot",
+            font=("Segoe UI", 10, "bold"),
+            bg=C_DIM, fg="white",
+            activebackground="#b03030", activeforeground="white",
+            relief="flat", bd=0, padx=10, pady=8,
+            cursor="hand2", command=self._on_stop,
+            state="disabled",
+        )
+        self._stop_btn.pack(fill="x")
+
+        tk.Frame(sidebar, bg=C_BORDER, height=1).pack(fill="x", padx=8, pady=6)
+
+        # ── Session stats ─────────────────────────────────────────────────────
         tk.Label(sidebar, text="Session Stats",
                  font=("Segoe UI", 9, "bold"),
-                 bg=C_PANEL, fg=C_GOLD).pack(pady=(8, 4))
+                 bg=C_PANEL, fg=C_GOLD).pack(pady=(0, 4))
 
         tk.Frame(sidebar, bg=C_BORDER, height=1).pack(fill="x", padx=8)
 
-        # Kill / chop counter
         self._stat_action_var = tk.StringVar(
             value="Kills: 0" if self._mode == "combat" else "Chops: 0"
         )
@@ -432,21 +481,21 @@ class EvilBotApp:
                      font=("Consolas", 9), bg=C_PANEL, fg=C_CYAN,
                      anchor="w").pack(fill="x", padx=12)
 
-        # Dynamic blocks counter (v3.1 — shows how many cliff tiles are known)
         tk.Frame(sidebar, bg=C_BORDER, height=1).pack(fill="x", padx=8, pady=4)
         tk.Label(sidebar, text="Map Learning",
                  font=("Segoe UI", 8), bg=C_PANEL, fg=C_DIM).pack(anchor="w", padx=12)
+
         self._blocks_var = tk.StringVar(value="Cliff blocks: —")
         tk.Label(sidebar, textvariable=self._blocks_var,
                  font=("Consolas", 9), bg=C_PANEL, fg=C_PURPLE,
                  anchor="w").pack(fill="x", padx=12)
+
         self._trunc_var = tk.StringVar(value="Truncations: 0")
         tk.Label(sidebar, textvariable=self._trunc_var,
                  font=("Consolas", 9), bg=C_PANEL, fg=C_YELLOW,
                  anchor="w").pack(fill="x", padx=12)
         self._truncations = 0
 
-        # Mode sprite at bottom of sidebar
         spr2 = _load_sprite(sprite_file, 48)
         if spr2:
             self._keep(spr2)
@@ -490,15 +539,16 @@ class EvilBotApp:
         self._log_box.tag_configure("READY",   foreground=C_GOLD)
         self._log_box.tag_configure("CONN",    foreground=C_GREEN)
         self._log_box.tag_configure("HEIGHT",  foreground="#7048a8")
+        self._log_box.tag_configure("LOGIN",   foreground=C_CYAN)
 
         # ── Status bar ────────────────────────────────────────────────────────
         sbar = tk.Frame(self.root, bg=C_HEADER, pady=3)
         sbar.pack(fill="x", side="bottom")
-        self._status_var = tk.StringVar(value="Starting…")
+        self._status_var = tk.StringVar(value="Ready — press Start Bot")
         tk.Label(sbar, textvariable=self._status_var,
                  font=("Segoe UI", 8), bg=C_HEADER, fg=C_DIM,
                  anchor="w").pack(side="left", padx=10)
-        tk.Label(sbar, text="EvilBot V3 by Blackberry",
+        tk.Label(sbar, text="EvilBot V4 by Blackberry",
                  font=("Segoe UI", 8), bg=C_HEADER, fg=C_DIM,
                  anchor="e").pack(side="right", padx=10)
 
@@ -523,7 +573,12 @@ class EvilBotApp:
         if "websocket"           in lo: return "CONN"
         if "login_ok"            in lo: return "CONN"
         if "map_change"          in lo: return "CONN"
-        if "http login"          in lo: return "CONN"
+        if "browser login"       in lo: return "CONN"
+        if "reusing cached"      in lo: return "LOGIN"
+        if "pydoll"              in lo: return "LOGIN"
+        if "chrome"              in lo: return "LOGIN"
+        if "recaptcha"           in lo: return "LOGIN"
+        if "token"               in lo: return "LOGIN"
         if "loaded height"       in lo: return "HEIGHT"
         if "cliff threshold"     in lo: return "HEIGHT"
         if "dynamic block"       in lo: return "BLOCK"
@@ -539,8 +594,6 @@ class EvilBotApp:
         return "INFO"
 
     def _update_stats(self, line: str):
-        """Parse a log line and update sidebar counters."""
-        # XP gain
         m = re.search(r"XP_GAIN skill=(\d+) xp=(\d+)", line)
         if m:
             sk, xp = int(m.group(1)), int(m.group(2))
@@ -549,48 +602,36 @@ class EvilBotApp:
                 self._xp_labels[sk].set(f"{SKILL_NAMES.get(sk, sk)}: {self._xp[sk]:,}")
             return
 
-        # Kill detected
         if re.search(r"defeated", line, re.I):
             self._kills += 1
             self._stat_action_var.set(f"Kills: {self._kills}")
             self._status_var.set(f"Kill #{self._kills} ↑")
             return
 
-        # Chop / log collected
         if "SKILLING_STOP" in line:
             self._chops += 1
             self._stat_action_var.set(f"Chops: {self._chops}")
             self._status_var.set(f"Chop #{self._chops} ↑")
             return
 
-        # PATH_TRUNCATED counter
         if "PATH_TRUNCATED" in line:
             self._truncations += 1
             self._trunc_var.set(f"Truncations: {self._truncations}")
 
-        # Dynamic blocks count from "Pathfinder ready" line
         m2 = re.search(r"(\d+) dynamic blocks", line)
         if m2:
             self._blocks_var.set(f"Cliff blocks: {m2.group(1)}")
 
-        # Dynamic block added at runtime
         if re.search(r"blocking \(", line, re.I) or re.search(r"dynamic block \(", line, re.I):
-            m3 = re.search(r"(\d+) dynamic blocks", line)
-            if not m3:
-                # Increment from current display
-                cur = self._blocks_var.get()
-                n_m = re.search(r"(\d+)", cur)
-                if n_m:
-                    self._blocks_var.set(f"Cliff blocks: {int(n_m.group(1)) + 1}")
+            m3 = re.search(r"(\d+)", self._blocks_var.get())
+            if m3:
+                self._blocks_var.set(f"Cliff blocks: {int(m3.group(1)) + 1}")
 
-        # Status line updates
         if "Attacking" in line:
             self._status_var.set(line.split("INFO")[-1].strip()[:70])
         elif "Moving to" in line:
             self._status_var.set(line.split("Moving to")[-1].strip()[:70])
-        elif "Chopping" in line:
-            self._status_var.set(line.split("INFO")[-1].strip()[:70])
-        elif "Walking to" in line:
+        elif "Chopping" in line or "Walking beside" in line:
             self._status_var.set(line.split("INFO")[-1].strip()[:70])
         elif "Arrived" in line:
             self._status_var.set(line.split("INFO")[-1].strip()[:70])
@@ -615,14 +656,24 @@ class EvilBotApp:
 
     # ── Bot lifecycle ─────────────────────────────────────────────────────────
 
+    def _on_start(self):
+        self._start_btn.configure(state="disabled")
+        self._launch_bot()
+
+    def _on_stop(self):
+        if self._bot_loop and self._running:
+            self._bot_loop.call_soon_threadsafe(self._bot_loop.stop)
+        self._stop_btn.configure(state="disabled", text="Stopping…", bg=C_DIM)
+        self._status_var.set("Stopping…")
+
     def _launch_bot(self):
         import bot as bot_mod
         import pathfinder
 
-        # Attach queue handler to both bot and pathfinder loggers (once)
+        # Attach queue handler to bot, pathfinder, and ws_transport loggers (once)
         if self._handler is None:
             self._handler = _QueueHandler(self._log_q)
-            for name in ("bot", "pathfinder"):
+            for name in ("bot", "pathfinder", "ws_transport"):
                 lg = logging.getLogger(name)
                 lg.addHandler(self._handler)
                 lg.setLevel(logging.DEBUG)
@@ -647,14 +698,12 @@ class EvilBotApp:
         mode = self._mode
 
         def _thread():
-            # Full pathfinder reset so a fresh session reloads everything
             pathfinder._loaded          = False
             pathfinder._tiles_loaded    = False
             pathfinder._heights_loaded  = False
             pathfinder._walls.clear()
             pathfinder._blocked_tiles.clear()
             pathfinder._heights.clear()
-            # Dynamic blocks persist across restarts (intentional — cliff memory)
             pathfinder._dynamic_blocked.clear()
 
             loop = asyncio.new_event_loop()
@@ -681,29 +730,20 @@ class EvilBotApp:
             finally:
                 self._running = False
                 self.root.after(0, lambda: self._set_btn_states(running=False))
-                self.root.after(0, lambda: self._status_var.set("Stopped."))
+                self.root.after(0, lambda: self._status_var.set(
+                    "Stopped — press Start Bot to run again"))
 
         self._bot_thread = threading.Thread(target=_thread, daemon=True)
         self._bot_thread.start()
 
-    def _on_stop(self):
-        if self._bot_loop and self._running:
-            self._bot_loop.call_soon_threadsafe(self._bot_loop.stop)
-        self._stop_btn.configure(state="disabled", text="Stopping…")
-        self._status_var.set("Stopping…")
-
-    def _on_restart(self):
-        self._start_btn.configure(state="disabled")
-        self._launch_bot()
-
     def _set_btn_states(self, running: bool):
         if running:
-            self._start_btn.configure(state="disabled", bg=C_DIM)
-            self._stop_btn.configure(state="normal", bg=C_RED, text="■  Stop")
+            self._start_btn.configure(state="disabled", bg=C_DIM, text="▶  Start Bot")
+            self._stop_btn.configure(state="normal",  bg=C_RED,  text="■  Stop Bot")
         else:
-            self._start_btn.configure(state="normal", bg="#285028", fg="white",
-                                       activebackground="#3a703a")
-            self._stop_btn.configure(state="disabled", bg=C_DIM, text="■  Stopped")
+            self._start_btn.configure(state="normal",  bg="#285028", fg="white",
+                                       activebackground="#3a703a", text="▶  Start Bot")
+            self._stop_btn.configure(state="disabled", bg=C_DIM,  text="■  Stop Bot")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
