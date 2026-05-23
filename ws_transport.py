@@ -39,13 +39,17 @@ import hashlib
 import http.client
 import json
 import logging
+import math
 import os
 import random
 import secrets
 import shutil
+import socket
 import ssl
 import struct
+import subprocess
 import tempfile
+import urllib.request
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -65,11 +69,17 @@ import requests
 
 ENC_BYTE_0 = 0xFE   # J = 254  — encrypted frame marker first byte
 ENC_BYTE_1 = 0x02   # H = 2    — protocol version byte
-PROTOCOL_VERSION = 11            # hs = 11 in GameManager JS
+PROTOCOL_VERSION = 12            # ms = 12 in GameManager JS (updated May 2026)
 CRYPTO_VERSION   = 2             # qe = 2
 OPCODE_MAPPING_VERSION = 1       # bt = 1
 
 STATE_DIR = Path.home() / ".evilquest"
+
+# CDP port used for browser-side transcript signing.
+# Initialised from EQ_CDP_PORT at import time so the bot can use browser
+# signing even when running with a cached auth token (no browser login).
+# async_http_login() also writes here when it opens its own Chrome session.
+_last_cdp_port: int = int(os.environ.get("EQ_CDP_PORT", 0) or 0)
 
 # Client-side logical opcodes that ARE in the opcode mapping
 # (all client opcodes except LOGIN=1 and CRYPTO_RESPONSE=2)
@@ -206,7 +216,16 @@ def _build_transcript(
     server_public_key: dict,
     client_public_key: dict,
 ) -> bytes:
-    """Canonical-JSON-encode the crypto handshake transcript."""
+    """Canonical-JSON-encode the crypto handshake transcript.
+
+    Mirrors the JS se() / gn() call in index-DGTyz-tl.js exactly:
+      D({ protocol, protocolVersion, accountId, deviceId, connectionId,
+          serverNonce, clientNonce, serverPublicKey, clientPublicKey })
+    where D() is the canonical-JSON serialiser (sorts object keys).
+
+    The "protocol" field sorts between "deviceId" and "protocolVersion",
+    so every byte after "deviceId" was wrong without it — causing 1008.
+    """
     return canonical_json({
         "protocol":        "evilquest-game-v2",
         "protocolVersion": PROTOCOL_VERSION,
@@ -218,6 +237,141 @@ def _build_transcript(
         "serverPublicKey": server_public_key,
         "clientPublicKey": client_public_key,
     }).encode("utf-8")
+
+
+# ── Browser-side transcript signing ──────────────────────────────────────────
+
+async def _browser_sign(transcript: bytes) -> bytes:
+    """Sign the WS transcript using the game's registered device key from Chrome.
+
+    The game stores its ECDSA-P256 device key in IndexedDB with extractable=False,
+    so we cannot export the private key.  Instead we call crypto.subtle.sign()
+    *inside* the Chrome tab via CDP, using window.gm.network.deviceSigningKeyPair.
+    This guarantees the signature matches whatever public key the game already
+    registered with the server — no key-registration race conditions.
+
+    Requires _last_cdp_port to be set (done by async_http_login).
+    """
+    from pydoll.browser.chromium import Chrome
+    from pydoll.browser.options import ChromiumOptions
+    from pydoll.browser.managers import BrowserProcessManager as _BPM
+
+    port = _last_cdp_port
+    if not port:
+        raise RuntimeError(
+            "No CDP port stored — async_http_login must run before browser signing"
+        )
+
+    # Minimal options: we only need to connect, not launch.
+    options = ChromiumOptions()
+    _chrome_exe = (
+        shutil.which("chrome") or
+        shutil.which("google-chrome") or
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    )
+    options.binary_location = _chrome_exe
+
+    # Noop process manager — Chrome is pre-launched; stop() must not kill it.
+    class _MockProc:
+        pid = 0
+        def poll(self): return None
+        def terminate(self): pass
+        def wait(self, timeout=None): pass
+
+    _pm = _BPM(process_creator=lambda _cmd: _MockProc())
+
+    _log.debug("_browser_sign: connecting to Chrome on port %d", port)
+    cdp_meta = json.loads(
+        urllib.request.urlopen(
+            f"http://localhost:{port}/json/version", timeout=5
+        ).read()
+    )
+    browser_ws = cdp_meta["webSocketDebuggerUrl"]
+
+    async with Chrome(options=options) as browser:
+        browser._browser_process_manager = _pm
+        tab = await browser.connect(browser_ws)   # browser-level connect; returns tabs[0]
+
+        # ── Find the game tab specifically (avoid blank / wrong tabs) ─────────
+        # If Chrome has multiple tabs, tabs[0] might not be the game.
+        # Search all tabs for one at evilquest.net.
+        try:
+            tabs = await browser.get_opened_tabs()
+            for _candidate in tabs:
+                try:
+                    _candidate_url = await _candidate.current_url
+                    if "evilquest.net" in _candidate_url:
+                        tab = _candidate
+                        _log.debug("_browser_sign: using game tab at %s",
+                                   _candidate_url[:80])
+                        break
+                except Exception:
+                    pass
+        except Exception as _te:
+            _log.debug("_browser_sign: tab search failed (%s) — using tabs[0]", _te)
+
+        # ── 1. Wait for the game's deviceSigningKeyPair to be ready ──────────
+        # The game sets it asynchronously in connect(token) → Aa(token).then(…).
+        _log.debug("_browser_sign: waiting for window.gm.network.deviceSigningKeyPair…")
+        for _i in range(100):            # up to 10 seconds
+            _r = await tab.execute_script(
+                "return window.gm?.network?.deviceSigningKeyPair?.privateKey ? 'ready' : null"
+            )
+            _v = _r.get("result", {}).get("result", {}).get("value")
+            if _v == "ready":
+                _log.debug("_browser_sign: deviceSigningKeyPair ready after %d polls", _i)
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise RuntimeError(
+                "Browser: game.network.deviceSigningKeyPair not ready after 10 s"
+            )
+
+        # ── 2. Inject transcript, sign, store result in localStorage ──────────
+        # We base64-encode the bytes to pass through JSON-safe JS string.
+        tb64 = base64.b64encode(transcript).decode()
+        _log.debug("_browser_sign: transcript to sign (%d bytes, b64=%s…)",
+                   len(transcript), tb64[:16])
+
+        await tab.execute_script("localStorage.removeItem('_botSignResult')")
+        _sign_js = f"""
+(async () => {{
+    try {{
+        const tb = Uint8Array.from(atob('{tb64}'), c => c.charCodeAt(0));
+        const key = window.gm.network.deviceSigningKeyPair.privateKey;
+        const sig = await crypto.subtle.sign(
+            {{name: 'ECDSA', hash: 'SHA-256'}}, key, tb
+        );
+        const b   = new Uint8Array(sig);
+        const b64 = btoa(String.fromCharCode(...b))
+            .replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
+        localStorage.setItem('_botSignResult', b64);
+    }} catch (e) {{
+        localStorage.setItem('_botSignResult', 'err:' + e.message);
+    }}
+}})();
+"""
+        await tab.execute_script(_sign_js)
+
+        # ── 3. Poll localStorage for the result (up to 5 s) ──────────────────
+        _sig_b64u = None
+        for _i in range(50):
+            await asyncio.sleep(0.1)
+            _r = await tab.execute_script(
+                "return localStorage.getItem('_botSignResult')"
+            )
+            _v = _r.get("result", {}).get("result", {}).get("value")
+            if _v:
+                _sig_b64u = _v
+                break
+
+        if not _sig_b64u:
+            raise RuntimeError("Browser signing timed out (no result in 5 s)")
+        if str(_sig_b64u).startswith("err:"):
+            raise RuntimeError(f"Browser signing JS error: {_sig_b64u}")
+
+        _log.debug("_browser_sign: signature (first 16 chars): %s", _sig_b64u[:16])
+        return _b64u_dec(_sig_b64u)
 
 
 # ── Session keys ──────────────────────────────────────────────────────────────
@@ -569,270 +723,449 @@ def _prepare_chrome_profile() -> str | None:
         return None
 
 
+def _get_listening_pid(port: int) -> int | None:
+    """Return the PID of the process listening on the given TCP port, or None."""
+    try:
+        r = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in r.stdout.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                parts = line.split()
+                if parts:
+                    return int(parts[-1])
+    except Exception:
+        pass
+    return None
+
+
+class _MockProc:
+    """
+    Proc-like wrapper for a Chrome browser process launched via PowerShell.
+
+    We launch Chrome through PowerShell's Start-Process (ShellExecuteEx), which
+    avoids all handle-inheritance issues.  The launcher process exits immediately;
+    we track the actual browser process by its PID found via netstat.
+
+    Exposes the same interface that pydoll's BrowserProcessManager expects.
+    """
+
+    def __init__(self, browser_pid: int):
+        self.pid = browser_pid
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        # pid=0 is a sentinel meaning "Chrome was pre-launched externally;
+        # we have no handle to track — always report alive so pydoll doesn't
+        # abort its startup loop prematurely."
+        if self.pid == 0:
+            return None
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {self.pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if str(self.pid) in r.stdout:
+                return None
+        except Exception:
+            pass
+        self.returncode = 0
+        return 0
+
+    def terminate(self) -> None:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(self.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+        except Exception:
+            pass
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+def _pick_free_port() -> int:
+    """Pick a random free TCP port on localhost."""
+    import socket as _sock
+    with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _launch_chrome_sync(
+    chrome_exe: str,
+    port: int,
+    profile_dir: str,
+    extra_args: list,
+    timeout: int = 120,
+) -> _MockProc:
+    """
+    Launch Chrome and block until its CDP endpoint responds.
+
+    Launch strategy (tried in order):
+    1. os.startfile  — direct ShellExecuteW from Python's own process
+                       (Python confirmed in WinSta0\\Default interactive desktop)
+    2. Manual prompt — if Chrome isn't up after 20 s, print the exact command
+                       for the user to run in a separate terminal; keep polling.
+
+    Returns a _MockProc wrapping the browser PID.
+    Raises RuntimeError if Chrome hasn't started within `timeout` seconds.
+    """
+    chrome_args = [
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--disable-sync",
+        "--disable-extensions",
+        *extra_args,
+    ]
+
+    # ── Attempt 1: os.startfile (ShellExecuteW, same process context as Python)
+    args_str = " ".join(f'"{a}"' if " " in a else a for a in chrome_args)
+    try:
+        _log.debug("Thread: os.startfile Chrome port=%d", port)
+        os.startfile(chrome_exe, arguments=args_str)
+        _log.debug("Thread: os.startfile returned OK")
+    except AttributeError:
+        # Python < 3.8 or non-Windows: arguments kwarg not available
+        _log.debug("Thread: os.startfile(arguments=) not available — skipping")
+    except OSError as exc:
+        _log.warning("Thread: os.startfile failed: %s", exc)
+
+    # ── Poll CDP; print manual instructions if Chrome isn't up after 20 s ─────
+    deadline      = _time.time() + timeout
+    last_err: Exception | None = None
+    printed_manual = False
+    elapsed_logged = 0
+
+    while _time.time() < deadline:
+        _time.sleep(1)
+        elapsed = int(_time.time() - (deadline - timeout))
+        try:
+            urllib.request.urlopen(
+                f"http://localhost:{port}/json/version", timeout=5
+            ).read()
+            browser_pid = _get_listening_pid(port) or 0
+            _log.info(
+                "Thread: Chrome CDP ready (pid=%d port=%d t=%ds)",
+                browser_pid, port, elapsed,
+            )
+            return _MockProc(browser_pid)
+        except Exception as exc:
+            last_err = exc
+            # After 20 s with no CDP, Chrome auto-launch didn't work.
+            # Print clear instructions so the user can open Chrome manually.
+            if elapsed >= 20 and not printed_manual:
+                printed_manual = True
+                cmd_display = f'"{chrome_exe}" {args_str}'
+                print("\n" + "=" * 70, flush=True)
+                print("  Chrome didn't open automatically.", flush=True)
+                print("  Please open a NEW terminal window and run:", flush=True)
+                print(f"\n    {cmd_display}\n", flush=True)
+                print("  Then log into EvilQuest in that Chrome window.", flush=True)
+                print("  The bot will connect automatically once you're logged in.", flush=True)
+                print("=" * 70 + "\n", flush=True)
+                _log.info(
+                    "browser login: waiting for manual Chrome launch on port %d", port
+                )
+            elif elapsed >= elapsed_logged + 30:
+                elapsed_logged = elapsed
+                remaining = int(deadline - _time.time())
+                _log.debug(
+                    "browser login: waiting for Chrome on port %d (%ds remaining)",
+                    port, remaining,
+                )
+
+    raise RuntimeError(
+        f"Chrome not available on port {port} within {timeout} s: {last_err}"
+    )
+
+
 async def async_http_login(username: str, password: str) -> tuple[str, str, str]:
     """
-    Browser-based login using pydoll (Chrome DevTools Protocol) to handle
-    reCAPTCHA v3 transparently.
-
-    Flow:
-      1. Launch a headless Chrome instance.
-      2. Navigate to https://evilquest.net/play — the page's own JS runs
-         reCAPTCHA v3 silently in the background.
-      3. GET /api/device-id (via browser-context fetch) to obtain device UUID.
-      4. Fill the login form with human-like typing & click Submit.
-      5. Poll localStorage["projectrs_token"] until the token appears
-         (set by the page's own login handler after a successful /api/login call).
-      6. POST /api/device-key (via browser-context fetch) to register our
-         persistent ECDSA signing key.
-      7. Export all cookies for the WebSocket upgrade header.
+    Browser-assisted login: opens Chrome to evilquest.net/play and waits for
+    the user to log in manually.  No form automation — the user handles the
+    login and reCAPTCHA themselves.  Once the token appears in localStorage
+    the bot registers the device signing key and saves the auth state.
 
     Returns (auth_token, device_id, cookie_header_string).
+
+    Chrome startup strategy
+    ───────────────────────
+    On Windows, asyncio's ProactorEventLoop creates IOCP (I/O Completion Port)
+    handles.  When subprocess.Popen is called from within the event loop,
+    Chrome's GPU/renderer child processes inherit those handles and crash
+    immediately — the CDP port is never bound.  The fix is to launch Chrome in
+    a thread pool worker (run_in_executor) where no asyncio event loop is
+    running, and poll the CDP endpoint in that same thread until Chrome is
+    ready.  We then hand the already-running Popen object to pydoll via a noop
+    process creator so pydoll's connection logic can attach to it.
     """
     # ── Fast path: reuse a cached token if it's still fresh ──────────────────
-    cached = load_auth_state()
-    if cached:
-        return cached
+    # When EQ_CDP_PORT is set, try to reach Chrome's CDP endpoint.
+    # • Chrome accessible → run the full browser flow so the IDB injection
+    #   happens on the neutral page BEFORE the game JS starts, guaranteeing
+    #   the game reads OUR signing key and registers it with the server.
+    # • Chrome not accessible → fall back to cached auth if available.
+    #   (The Python key from the last successful injection is likely still
+    #   registered; browser signing will fail gracefully and Python signing
+    #   will be used as the fallback.)
+    _eq_cdp_env = int(os.environ.get("EQ_CDP_PORT", "0")) or 0
+    _chrome_accessible = False
+    if _eq_cdp_env:
+        try:
+            urllib.request.urlopen(
+                f"http://localhost:{_eq_cdp_env}/json/version", timeout=2
+            )
+            _chrome_accessible = True
+        except Exception:
+            pass
+
+    if not _chrome_accessible:
+        cached = load_auth_state()
+        if cached:
+            if _eq_cdp_env:
+                _log.info(
+                    "Chrome not reachable on port %d — using cached auth",
+                    _eq_cdp_env,
+                )
+            # ── Register our Python key now, while no game session is running ──
+            # Without Chrome there's no live game to race us.  Registering our
+            # Python key here means the server will accept our Python-signed WS
+            # handshake even though we never went through the browser login flow
+            # this session.
+            _cached_token, _cached_did, _cached_cookies = cached
+            _signing_key = load_signing_key()
+            if _signing_key is not None:
+                _pub_jwk_quick = _ec_pub_to_jwk(_signing_key.public_key(), key_ops=["verify"])
+                _log.debug(
+                    "cached-auth: registering Python key x=%s…",
+                    _pub_jwk_quick["x"][:12],
+                )
+                try:
+                    import requests as _req_mod
+                    _qs = _req_mod.Session()
+                    _qs.headers.update(_API_HEADERS)
+                    # Parse and apply the cached cookies (contains eq_device_id etc.)
+                    for _ck in _cached_cookies.split(";"):
+                        _ck = _ck.strip()
+                        if "=" in _ck:
+                            _cn, _cv = _ck.split("=", 1)
+                            _qs.cookies.set(_cn.strip(), _cv.strip(),
+                                            domain="evilquest.net")
+                    _qr = _qs.post(
+                        "https://evilquest.net/api/device-key",
+                        json={"publicKey": _pub_jwk_quick},
+                        headers={"Authorization": f"Bearer {_cached_token}"},
+                        timeout=10,
+                    )
+                    _qr.raise_for_status()
+                    _qrd = _qr.json()
+                    if _qrd.get("ok"):
+                        _log.info("cached-auth: device-key registered (Python key)")
+                    else:
+                        _log.warning("cached-auth: device-key non-ok: %s", _qrd)
+                except Exception as _qe:
+                    _log.warning("cached-auth: device-key registration failed: %s", _qe)
+            else:
+                _log.warning(
+                    "cached-auth: no Python signing key found — "
+                    "WS handshake will likely fail; run with Chrome to fix"
+                )
+            return cached
 
     try:
         from pydoll.browser.chromium import Chrome
         from pydoll.browser.options import ChromiumOptions
-        from pydoll.constants import Key
     except ImportError as exc:
         raise ImportError(
             "pydoll-python is required for reCAPTCHA-aware login. "
             "Install it with:  pip install pydoll-python"
         ) from exc
 
-    options = ChromiumOptions()
-    # Do NOT use --headless=new: reCAPTCHA v3 scores headless sessions too low.
-    # Do NOT use --no-sandbox: shows a security banner that degrades reCAPTCHA.
-    # Do NOT use --disable-blink-features=AutomationControlled: unsupported flag
-    #   on modern Chrome; shows a warning banner and does not help reCAPTCHA.
-    # Do NOT use --disable-infobars: same — unsupported and triggers a banner.
-    # Do NOT pass --user-data-dir pointing to a partial profile copy — Chrome hangs
-    #   on startup when Default/Preferences is missing, blocking CDP for 30+ s.
-    #   Let pydoll create a clean temp dir so Chrome starts reliably every time.
-    options.add_argument("--window-size=1280,800")
-    options.add_argument("--window-position=0,0")
-    options.add_argument("--disable-sync")          # skip Google account sync prompt
-    options.add_argument("--disable-extensions")   # faster startup, no extension noise
-    options.start_timeout = 30   # seconds to wait for CDP port (default is 10)
-
-    # Use the system-installed Chrome on Windows
+    # ── Locate Chrome binary ──────────────────────────────────────────────────
     _chrome_win = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    if os.path.exists(_chrome_win):
-        options.binary_location = _chrome_win
+    _chrome_exe = _chrome_win if os.path.exists(_chrome_win) else (
+        shutil.which("google-chrome") or shutil.which("chromium") or "chrome"
+    )
 
-    _log.info("pydoll: launching Chrome (visible) for reCAPTCHA-aware login…")
+    # ── Choose a free port and a throwaway profile directory ─────────────────
+    _chrome_port    = _pick_free_port()
+    _chrome_profile = tempfile.mkdtemp(prefix="eq_chrome_")
 
-    async with Chrome(options=options) as browser:
-        tab = await browser.start()
+    # ── EQ_CDP_PORT override: skip auto-launch, connect to pre-started Chrome ──
+    # Set this env var to the port of a Chrome already running with
+    # --remote-debugging-port=PORT, e.g. launched via PowerShell Start-Process.
+    _forced_cdp_port = int(os.environ.get("EQ_CDP_PORT", "0")) or None
 
-        # ── 1. Navigate to game page ──────────────────────────────────────────
-        # First visit the root domain so cookies and reCAPTCHA session are
-        # established, then navigate to /play where the login form lives.
-        # reCAPTCHA v3 scores passively; we pause between pages to accumulate
-        # a higher trust score.
-        _log.info("pydoll: navigating to evilquest.net (root)")
-        await tab.go_to("https://evilquest.net")
-        await asyncio.sleep(random.uniform(4.0, 6.0))
-
-        _log.info("pydoll: navigating to evilquest.net/play")
-        await tab.go_to("https://evilquest.net/play")
-        await asyncio.sleep(3.0)
-
-        # Simulate natural human mouse movement across the page before
-        # interacting with the form.  reCAPTCHA v3 monitors cursor behaviour.
-        try:
-            for _mx, _my in [
-                (640, 400), (300, 250), (750, 550), (500, 300),
-                (640, 400),
-            ]:
-                _mx += random.randint(-30, 30)
-                _my += random.randint(-20, 20)
-                await tab.mouse.move(_mx, _my, humanize=True)
-                await asyncio.sleep(random.uniform(0.2, 0.5))
-        except Exception:
-            pass   # mouse simulation is best-effort
-
-        # ── 2. Obtain device UUID ─────────────────────────────────────────────
-        device_id: str = ""
-        try:
-            resp = await tab.request.get("https://evilquest.net/api/device-id")
-            ddata = resp.json()
-            device_id = ddata.get("deviceId", "")
-            if device_id:
-                _log.info("pydoll: device_id=%s…", device_id[:8])
-        except Exception as exc:
-            _log.warning("pydoll: /api/device-id failed (%s) — will use stored or empty", exc)
-
-        # ── 3. Find the login form ────────────────────────────────────────────
-        _log.info("pydoll: locating login form inputs")
-
-        # Some SPAs hide the login form behind a modal.  Try to find inputs
-        # directly first; if not present, look for a "Login" trigger to click.
-        user_field = await tab.query(
-            'input[type="text"]', timeout=4, raise_exc=False
+    if _forced_cdp_port:
+        _chrome_port    = _forced_cdp_port
+        _chrome_profile = tempfile.mkdtemp(prefix="eq_chrome_")
+        _chrome_proc    = _MockProc(0)   # dummy — Chrome already running
+        _log.info(
+            "browser login: EQ_CDP_PORT=%d — connecting to pre-started Chrome",
+            _chrome_port,
         )
-        if user_field is None:
-            # Look for a login button/link that opens the form
-            for _trigger_text in ("Login", "Sign In", "Log In"):
-                trigger = await tab.find(
-                    tag_name="button", text=_trigger_text, timeout=2, raise_exc=False
+        print("\n" + "=" * 60)
+        print(f"  Connecting to Chrome on port {_chrome_port}…")
+        print("  Please log into EvilQuest in that Chrome window.")
+        print("=" * 60 + "\n", flush=True)
+    else:
+        print("\n" + "=" * 60)
+        print("  Chrome is opening — please log into EvilQuest.")
+        print("  The bot will continue automatically once you're in.")
+        print("  (Waiting up to 3 minutes...)")
+        print("=" * 60 + "\n", flush=True)
+        _log.info("browser login: Chrome pid pending — port=%d profile=%s",
+                  _chrome_port, _chrome_profile)
+
+        # Chrome cannot be launched from Python's subprocess context on this machine.
+        # _launch_chrome_sync tries os.startfile first, then prints manual instructions.
+        _loop        = asyncio.get_event_loop()
+        _chrome_proc = await _loop.run_in_executor(
+            None,
+            _launch_chrome_sync,
+            _chrome_exe,
+            _chrome_port,
+            _chrome_profile,
+            ["--window-size=1280,800", "--start-maximized"],
+            120,
+        )
+        _log.info("browser login: Chrome CDP ready port=%d", _chrome_port)
+
+    auth_token = None
+    device_id  = None
+    cookie_str = ""
+
+    try:
+        # ── pydoll options ────────────────────────────────────────────────────
+        # Do NOT add --remote-debugging-port here: pydoll picks its own port
+        # internally (e.g. 9225) and passes it first, so adding ours would
+        # create a duplicate flag that Chrome ignores.  We redirect pydoll's
+        # ConnectionHandler to our actual port below, after entering the context.
+        options = ChromiumOptions()
+        options.binary_location = _chrome_exe
+        # Chrome is already up; pydoll's start_timeout only covers the initial
+        # CDP handshake which will succeed immediately.
+        options.start_timeout = 10
+
+        from pydoll.browser.managers import BrowserProcessManager as _BPM
+
+        # Noop process creator: pydoll calls stop_process() on __aexit__; we
+        # return our already-running _MockProc so it doesn't kill Chrome.
+        _proc_ref = _chrome_proc
+        def _noop_creator(cmd: list) -> subprocess.Popen:
+            _log.debug("pydoll: noop_creator — returning pre-launched Chrome pid=%d",
+                       _proc_ref.pid)
+            return _proc_ref
+
+        _pm = _BPM(process_creator=_noop_creator)
+
+        # ── Fetch browser-level WebSocket URL directly from Chrome's CDP ──────
+        # This lets us use browser.connect() instead of browser.start(), which
+        # bypasses all of pydoll's port-ping / _verify_browser_running logic.
+        import json as _json
+        _cdp_meta = _json.loads(
+            urllib.request.urlopen(
+                f"http://localhost:{_chrome_port}/json/version", timeout=5
+            ).read()
+        )
+        _browser_ws = _cdp_meta["webSocketDebuggerUrl"]
+        _log.debug("pydoll: browser WS → %s", _browser_ws)
+
+        async with Chrome(options=options) as browser:
+            browser._browser_process_manager = _pm
+            # connect() sets the WS address directly and returns the first tab.
+            # No process launch, no port ping, no FailedToStartBrowser risk.
+            tab = await browser.connect(_browser_ws)
+
+            # ── Store CDP port so _browser_sign() can reconnect later ─────────
+            # Chrome stays running after this async-with exits (noop_creator).
+            # _browser_sign() opens a fresh CDP connection when it needs to sign.
+            global _last_cdp_port
+            _last_cdp_port = _chrome_port
+            _log.debug("browser login: CDP port %d stored for later browser signing",
+                       _chrome_port)
+
+            # ── Pre-seed IDB with our signing key BEFORE the game page loads ──
+            # Timing problem: if we navigate straight to /play, the game's JS
+            # calls Ia() (IDB read) during page init, possibly BEFORE we inject.
+            # Fix: navigate to a neutral page first so no game JS is running,
+            # inject our key into IDB, then navigate to /play.  The game starts
+            # fresh, Ia() reads our key (no cache), Aa() registers it.
+            _log.debug("browser login: navigating away to stop any running game JS…")
+            await tab.go_to("https://evilquest.net/")
+
+            signing_key = load_signing_key()
+            if signing_key is None:
+                signing_key = generate_private_key(SECP256R1())
+                save_signing_key(signing_key)
+
+            _priv_jwk_idb = {**_ec_priv_to_jwk(signing_key), "ext": False, "key_ops": ["sign"]}
+            _pub_jwk_idb  = _ec_pub_to_jwk(signing_key.public_key(), key_ops=["verify"])
+            _inject_js = """
+(async () => {
+    try {
+        const privJwk = """ + json.dumps(_priv_jwk_idb) + """;
+        const pubJwk  = """ + json.dumps(_pub_jwk_idb) + """;
+        const priv = await crypto.subtle.importKey(
+            "jwk", privJwk, {name:"ECDSA",namedCurve:"P-256"}, false, ["sign"]);
+        const pub  = await crypto.subtle.importKey(
+            "jwk", pubJwk,  {name:"ECDSA",namedCurve:"P-256"}, true,  ["verify"]);
+        await new Promise((res, rej) => {
+            const req = indexedDB.open("evilquest_device_crypto_v1");
+            req.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains("keys"))
+                    db.createObjectStore("keys", {keyPath:"id"});
+            };
+            req.onsuccess = (e) => {
+                const db = e.target.result;
+                const tx = db.transaction("keys", "readwrite");
+                tx.objectStore("keys").put({
+                    id: "ecdsa-p256",
+                    keyPair: {privateKey: priv, publicKey: pub},
+                    publicJwk: pubJwk
+                });
+                tx.oncomplete = () => res();
+                tx.onerror   = () => rej(tx.error);
+            };
+            req.onerror = () => rej(req.error);
+        });
+        localStorage.setItem("_botKeyOk", "1");
+    } catch(e) {
+        localStorage.setItem("_botKeyOk", "err:" + e.message);
+    }
+})();
+"""
+            await tab.execute_script(_inject_js)
+            for _i in range(40):
+                await asyncio.sleep(0.05)
+                _r = await tab.execute_script(
+                    "return localStorage.getItem('_botKeyOk')"
                 )
-                if trigger is None:
-                    trigger = await tab.find(
-                        tag_name="a", text=_trigger_text, timeout=1, raise_exc=False
+                _v = _r.get("result", {}).get("result", {}).get("value")
+                if _v == "1":
+                    _log.info(
+                        "browser login: signing key injected into IDB (x=%s…)",
+                        _pub_jwk_idb["x"][:12],
                     )
-                if trigger:
-                    _log.info("pydoll: clicking '%s' trigger to open login form", _trigger_text)
-                    await trigger.click()
-                    await asyncio.sleep(1.0)
                     break
-
-            # Retry — also cover forms that use type="email" or omit the type
-            user_field = await tab.query(
-                'input[type="text"]', timeout=6, raise_exc=False
-            )
-            if user_field is None:
-                user_field = await tab.query(
-                    'input:not([type="password"]):not([type="hidden"])'
-                    ':not([type="checkbox"]):not([type="submit"]):not([type="button"])',
-                    timeout=4, raise_exc=False,
-                )
-
-        if user_field is None:
-            raise RuntimeError(
-                "pydoll: could not locate username input on the login page. "
-                "Page structure may have changed."
-            )
-
-        pass_field = await tab.query(
-            'input[type="password"]', timeout=5, raise_exc=False
-        )
-        if pass_field is None:
-            raise RuntimeError(
-                "pydoll: could not locate password input on the login page. "
-                "Page structure may have changed."
-            )
-
-        # ── 4. Fill credentials with human-like timing ────────────────────────
-        # type_text(humanize=True) calls click() internally then types with
-        # randomised inter-keystroke delays — do NOT add an extra explicit click
-        # beforehand or the field ends up clicked twice.
-        _log.info("pydoll: filling credentials")
-        await user_field.type_text(username, humanize=True)
-        await asyncio.sleep(random.uniform(0.4, 0.8))
-
-        await pass_field.type_text(password, humanize=True)
-        await asyncio.sleep(random.uniform(0.4, 0.8))
-
-        # ── 4b. Tick "Remember username on this device" if present ───────────
-        remember_box = await tab.query('input[type="checkbox"]', timeout=2, raise_exc=False)
-        if remember_box:
-            try:
-                await remember_box.click()
-                _log.info("pydoll: checked 'Remember username' checkbox")
-                await asyncio.sleep(random.uniform(0.2, 0.4))
-            except Exception as exc:
-                _log.debug("pydoll: checkbox click failed (%s) — continuing", exc)
-        else:
-            _log.debug("pydoll: no checkbox found on page")
-
-        # ── 5. Submit the form ────────────────────────────────────────────────
-        # Enable network logging so we can see the /api/login response
-        _login_responses: list[dict] = []
-        try:
-            await tab.enable_network_events()
-
-            async def _capture_login(event: dict) -> None:
-                url = event.get("response", {}).get("url", "") or event.get("url", "")
-                if "api/login" in url:
-                    status = event.get("response", {}).get("status", "?")
-                    _log.info("pydoll: /api/login response status=%s", status)
-                    _login_responses.append(event)
-
-            await tab.on("Network.responseReceived", _capture_login)
-        except Exception:
-            pass   # network event capture is best-effort
-
-        _log.info("pydoll: submitting login form")
-        submit_btn = None
-        for _sel in ('button[type="submit"]',):
-            submit_btn = await tab.query(_sel, timeout=3, raise_exc=False)
-            if submit_btn:
-                break
-        if submit_btn is None:
-            for _txt in ("Login", "Log In", "Sign In", "Enter", "Play"):
-                submit_btn = await tab.find(
-                    tag_name="button", text=_txt, timeout=2, raise_exc=False
-                )
-                if submit_btn:
+                if _v and str(_v).startswith("err:"):
+                    _log.warning("browser login: IDB injection failed: %s", _v)
                     break
-        if submit_btn is None:
-            submit_btn = await tab.find(tag_name="button", timeout=3, raise_exc=False)
+            else:
+                _log.warning("browser login: IDB injection timed out — continuing anyway")
 
-        if submit_btn:
-            await submit_btn.click()
-        else:
-            # Fallback: press Enter in the password field
-            _log.warning("pydoll: no submit button found — pressing Enter")
-            await tab.keyboard.press(Key.ENTER)
+            # Now navigate to the game.  The game starts fresh: Ia() reads our
+            # key from IDB (oe cache is empty), Aa() registers it with the server.
+            _log.debug("browser login: navigating to /play with our key in IDB…")
+            await tab.go_to("https://evilquest.net/play")
 
-        # ── 6. Wait for the auth token to appear in localStorage ──────────────
-        # The page's own login handler stores the token at
-        # localStorage["projectrs_token"] after a successful /api/login call.
-        _log.info("pydoll: waiting for auth token in localStorage…")
-        auth_token: str = ""
-        for attempt in range(40):        # up to 20 seconds
-            await asyncio.sleep(0.5)
-            result = await tab.execute_script(
-                "return localStorage.getItem('projectrs_token')"
-            )
-            value = (
-                result
-                .get("result", {})
-                .get("result", {})
-                .get("value")
-            )
-            if value and isinstance(value, str) and len(value) > 10:
-                auth_token = value
-                break
-            if attempt % 8 == 7:
-                _log.info("pydoll: still waiting for token (%ds)…", (attempt + 1) // 2)
-
-        if not auth_token:
-            # ── Manual login fallback ─────────────────────────────────────────
-            # Automated login scored too low on reCAPTCHA v3.  Keep Chrome open
-            # and ask the user to log in themselves.  We'll read the token from
-            # localStorage once they're in.
-            diag = await tab.execute_script(
-                "return JSON.stringify({"
-                "  err: (document.querySelector('[class*=\"error\"],[class*=\"Error\"]"
-                ",[class*=\"message\"]')?.textContent || '').trim()"
-                "})"
-            )
-            page_err = ""
-            try:
-                page_err = json.loads(
-                    diag.get("result", {}).get("result", {}).get("value", "{}")
-                ).get("err", "")
-            except Exception:
-                pass
-
-            print("\n" + "=" * 60)
-            print("  reCAPTCHA blocked automated login.")
-            if page_err:
-                print(f"  Page error: {page_err}")
-            print()
-            print("  Chrome is still open. Please:")
-            print("    1. Log in to EvilQuest in the Chrome window.")
-            print("    2. Wait for the game to load fully.")
-            print("    3. The bot will detect the token automatically.")
-            print("  (Waiting up to 120 seconds...)")
-            print("=" * 60 + "\n")
-
-            for _wait in range(240):    # 120 seconds
+            # ── Poll localStorage until the token appears ──────────────────────
+            for attempt in range(360):      # up to 3 minutes
                 await asyncio.sleep(0.5)
                 result = await tab.execute_script(
                     "return localStorage.getItem('projectrs_token')"
@@ -845,61 +1178,183 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
                 )
                 if value and isinstance(value, str) and len(value) > 10:
                     auth_token = value
-                    _log.info("pydoll: manual login detected — token acquired")
+                    _log.info("browser login: token detected")
                     break
-                if _wait % 20 == 19:
-                    remaining = (240 - _wait - 1) // 2
-                    _log.info("pydoll: waiting for manual login (%ds remaining)…", remaining)
+                if attempt % 30 == 29:
+                    remaining = (360 - attempt - 1) // 2
+                    _log.info("browser login: waiting for login… (%ds remaining)", remaining)
 
             if not auth_token:
-                raise RuntimeError(
-                    "pydoll: login failed — no token appeared after manual login window. "
-                    "Check credentials and reCAPTCHA status."
+                raise RuntimeError("browser login: no token after 3 minutes — did you log in?")
+
+            # ── Wait for game's Aa() to complete, then register our key last ─────
+            # Aa(token) is async: it registers the game's IDB key with the server.
+            # We must wait for it to finish before registering our Python key,
+            # otherwise the game's Aa() will overwrite our registration.
+            # Indicator: window.gm.network.deviceSigningKeyPair is set only after
+            # Aa() resolves and assigns keyPair to the network object.
+            _log.debug("browser login: waiting for game Aa() to complete…")
+            _aa_done = False
+            for _i in range(150):      # up to 15 seconds
+                await asyncio.sleep(0.1)
+                try:
+                    _r = await tab.execute_script(
+                        "return window.gm?.network?.deviceSigningKeyPair?.privateKey ? 'ready' : null"
+                    )
+                    _v = _r.get("result", {}).get("result", {}).get("value")
+                    if _v == "ready":
+                        _aa_done = True
+                        _log.info(
+                            "browser login: game Aa() complete — deviceSigningKeyPair ready (%.1fs)",
+                            _i * 0.1,
+                        )
+                        break
+                except Exception:
+                    pass
+
+            if not _aa_done:
+                _log.warning(
+                    "browser login: deviceSigningKeyPair not detected after 15 s — "
+                    "registering our key anyway (game may have signed with different key)"
                 )
 
-        _log.info("pydoll: token acquired — registering device key…")
+            # ── Register our Python key via browser fetch() ───────────────────
+            # Using the browser's own fetch() sends the game's session cookies
+            # automatically, guaranteeing correct auth.  This happens AFTER Aa()
+            # so our registration is definitively the last one the server sees.
+            _pub_jwk_reg = _ec_pub_to_jwk(signing_key.public_key(), key_ops=["verify"])
+            _log.debug("register: Python key x=%s… y=%s…",
+                       _pub_jwk_reg["x"][:12], _pub_jwk_reg["y"][:12])
 
-        # ── 7. Register / refresh the persistent ECDSA device signing key ─────
-        signing_key = load_signing_key()
-        if signing_key is None:
-            signing_key = generate_private_key(SECP256R1())
-            save_signing_key(signing_key)
+            # Clear any stale result from a previous run before injecting
+            await tab.execute_script("localStorage.removeItem('_botKeyReg')")
 
-        pub_jwk = _ec_pub_to_jwk(signing_key.public_key(), key_ops=["verify"])
-        try:
-            dk_resp = await tab.request.post(
-                "https://evilquest.net/api/device-key",
-                json={"publicKey": pub_jwk},
-                headers=[{"name": "Authorization", "value": f"Bearer {auth_token}"}],
+            _reg_js = """
+(async () => {
+    try {
+        const token = localStorage.getItem('projectrs_token');
+        const pubJwk = """ + json.dumps(_pub_jwk_reg) + """;
+        const resp = await fetch('/api/device-key', {
+            method: 'POST',
+            headers: {
+                'Content-Type':  'application/json',
+                'Authorization': 'Bearer ' + token,
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({publicKey: pubJwk}),
+        });
+        const data = await resp.json();
+        localStorage.setItem('_botKeyReg', JSON.stringify({status: resp.status, data}));
+    } catch (e) {
+        localStorage.setItem('_botKeyReg', JSON.stringify({err: e.message}));
+    }
+})();
+"""
+            await tab.execute_script(_reg_js)
+
+            # Poll for registration result (up to 5 s)
+            _reg_result = None
+            for _i in range(50):
+                await asyncio.sleep(0.1)
+                try:
+                    _r = await tab.execute_script(
+                        "return localStorage.getItem('_botKeyReg')"
+                    )
+                    _v = _r.get("result", {}).get("result", {}).get("value")
+                    if _v:
+                        _reg_result = json.loads(_v)
+                        break
+                except Exception:
+                    pass
+
+            if _reg_result is None:
+                _log.warning("browser login: browser fetch() key registration timed out")
+            elif "err" in _reg_result:
+                _log.warning("browser login: browser fetch() registration JS error: %s",
+                             _reg_result["err"])
+            elif _reg_result.get("status") == 200 and _reg_result.get("data", {}).get("ok"):
+                _log.info("browser login: device-key registered OK (browser fetch)")
+            else:
+                _log.warning("browser login: browser fetch() registration unexpected result: %s",
+                             _reg_result)
+
+            # ── Export cookies so WS upgrade header uses the right identity ────
+            cookies = await tab.get_cookies()
+            cookie_dict = {
+                c["name"]: c["value"]
+                for c in cookies
+                if "evilquest" in c.get("domain", "")
+            }
+            _log.debug("browser login: exported %d cookies", len(cookie_dict))
+
+            api_session = requests.Session()
+            api_session.headers.update({
+                "User-Agent":      _BROWSER_UA,
+                "Accept":          "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Origin":          "https://evilquest.net",
+                "Referer":         "https://evilquest.net/play",
+            })
+            api_session.cookies.update(cookie_dict)
+
+            # GET /api/device-id
+            try:
+                did_resp = api_session.get(
+                    "https://evilquest.net/api/device-id", timeout=10
+                )
+                did_resp.raise_for_status()
+                device_id = did_resp.json().get("deviceId", "")
+                _log.info("browser login: device_id=%s…", str(device_id)[:8])
+            except Exception as exc:
+                _log.debug("browser login: /api/device-id failed (%s)", exc)
+                device_id = ""
+
+            # ── Belt+suspenders: also register our key from Python ─────────────
+            # belt+suspenders: Python HTTP POST as a second registration attempt.
+            # The browser fetch() above is the primary mechanism; this adds
+            # redundancy in case the browser fetch() failed for any reason.
+            try:
+                _dk = api_session.post(
+                    "https://evilquest.net/api/device-key",
+                    json={"publicKey": _pub_jwk_reg},
+                    headers={"Authorization": f"Bearer {auth_token}"},
+                    timeout=10,
+                )
+                _dk.raise_for_status()
+                _dk_data = _dk.json()
+                if not _dk_data.get("ok"):
+                    _log.warning("device-key registration non-ok: %s", _dk_data)
+                else:
+                    _log.info("browser login: device-key registered OK (Python HTTP)")
+            except Exception as exc:
+                _log.warning("browser login: Python device-key registration failed: %s", exc)
+
+            # ── Build cookie string for the WebSocket upgrade header ──────────
+            cookie_str = "; ".join(
+                f"{c['name']}={c['value']}"
+                for c in cookies
+                if "evilquest" in c.get("domain", "")
             )
-            dk_data = dk_resp.json()
-            if not dk_data.get("ok"):
-                raise RuntimeError(f"device-key rejected: {dk_data}")
-            _log.info("pydoll: device-key registered OK")
-        except Exception as exc:
-            raise RuntimeError(f"pydoll: device-key registration failed: {exc}") from exc
+            eq_cookie = next(
+                (c["value"] for c in cookies if c["name"] == "eq_device_id"), ""
+            )
+            if device_id:
+                save_device_state(device_id, eq_cookie)
 
-        # ── 8. Export cookies for the WebSocket upgrade header ────────────────
-        cookies = await tab.get_cookies()
+    finally:
+        # Only terminate Chrome if we launched it ourselves
+        if not _forced_cdp_port:
+            try:
+                if _chrome_proc.poll() is None:
+                    _chrome_proc.terminate()
+                    _chrome_proc.wait(timeout=5)
+            except Exception:
+                pass
+        shutil.rmtree(_chrome_profile, ignore_errors=True)
 
-        # Filter to evilquest.net cookies and build a "name=value; …" string
-        cookie_str = "; ".join(
-            f"{c['name']}={c['value']}"
-            for c in cookies
-            if "evilquest" in c.get("domain", "")
-        )
-
-        # Persist device state for future sessions
-        eq_cookie = next(
-            (c["value"] for c in cookies if c["name"] == "eq_device_id"), ""
-        )
-        if device_id:
-            save_device_state(device_id, eq_cookie)
-
-    # Persist auth state so the next run within 23 h can skip the browser login
     save_auth_state(auth_token, device_id, cookie_str)
-
-    _log.info("pydoll: browser login complete")
+    _log.info("browser login: complete — auth cached for next 23h")
     return auth_token, device_id, cookie_str
 
 
@@ -1035,29 +1490,77 @@ def _read_ws_frame(sock: ssl.SSLSocket) -> tuple[int, bytes]:
 
 
 def _sync_upgrade(token: str, device_cookie: str) -> ssl.SSLSocket:
-    """Perform the HTTP→WebSocket upgrade."""
+    """
+    Perform the HTTP→WebSocket upgrade.
+
+    Header order and presence are matched to Chrome 124's observed WebSocket
+    upgrade requests.  Differences from the previous version:
+
+    • ORDER: Chrome sends Connection/Pragma/Cache-Control before User-Agent,
+      then Upgrade/Origin/Sec-WebSocket-* in a specific order, then
+      Accept-Encoding/Accept-Language, then the WebSocket-specific headers,
+      then Cookie.  The previous order was scrambled relative to Chrome.
+
+    • ADDED: Accept-Encoding and Accept-Language.  Chrome always sends these
+      in WebSocket upgrade requests; omitting them is a fingerprint gap.
+
+    • REMOVED: Referer.  Chrome does NOT include a Referer header in WebSocket
+      upgrade requests (the Fetch spec omits it for "websocket" requests).
+      Having it was itself a bot fingerprint.
+
+    • TCP_NODELAY: Chrome disables Nagle's algorithm (TCP_NODELAY=1) for all
+      WebSocket connections.  Python's default socket has Nagle enabled, which
+      can batch small frames differently from a browser — detectable via TCP
+      segment timing and size distributions.  We set TCP_NODELAY after the
+      TLS handshake to match Chrome's behaviour.
+    """
     ctx  = ssl.create_default_context()
     conn = http.client.HTTPSConnection("evilquest.net", 443, context=ctx, timeout=20)
+
+    # Python's http.client._send_request() checks whether 'host' and
+    # 'accept-encoding' are present in the headers dict and sets skip_host /
+    # skip_accept_encoding accordingly, so including them here gives us full
+    # control over their position without duplicating them.
     conn.request("GET", "/ws/game", headers={
-        "Host":                    "evilquest.net",
-        "Upgrade":                 "websocket",
-        "Connection":              "Upgrade",
-        "Sec-WebSocket-Key":       base64.b64encode(os.urandom(16)).decode(),
-        "Sec-WebSocket-Version":   "13",
-        "Sec-WebSocket-Protocol":  f"auth.{token}",
+        "Host":                     "evilquest.net",
+        "Connection":               "Upgrade",
+        "Pragma":                   "no-cache",
+        "Cache-Control":            "no-cache",
+        "User-Agent":               _BROWSER_UA,
+        "Upgrade":                  "websocket",
+        "Origin":                   "https://evilquest.net",
+        "Sec-WebSocket-Version":    "13",
+        "Accept-Encoding":          "gzip, deflate, br, zstd",
+        "Accept-Language":          "en-US,en;q=0.9",
+        "Sec-WebSocket-Key":        base64.b64encode(os.urandom(16)).decode(),
         "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
-        "Origin":                  "https://evilquest.net",
-        "User-Agent":              _BROWSER_UA,
-        "Referer":                 "https://evilquest.net/play",
-        "Cookie":                  device_cookie,   # full "name=val; name=val" header
-        "Pragma":                  "no-cache",
-        "Cache-Control":           "no-cache",
+        "Sec-WebSocket-Protocol":   f"auth.{token}",
+        "Cookie":                   device_cookie,
     })
     resp = conn.getresponse()
     if resp.status != 101:
         body = resp.read(256).decode("utf-8", errors="replace")
         raise ConnectionError(f"WebSocket upgrade failed: {resp.status} {resp.reason} — {body}")
-    return conn.sock
+
+    # Log any Set-Cookie headers in the 101 response — the server may issue a
+    # fresh eq_ws_session per upgrade that we should carry into the next run.
+    for hdr, val in resp.headers.items():
+        if hdr.lower() == "set-cookie":
+            _log.debug("101 Set-Cookie: %s", val[:120])
+
+    sock = conn.sock
+    # Disable Nagle's algorithm to match Chrome's TCP behaviour for WebSocket
+    # connections.  Without this, the OS may coalesce multiple small sends into
+    # a single TCP segment, producing different segment-size distributions from
+    # a browser and triggering packet-timing / TCP-fingerprint detection.
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except (OSError, AttributeError):
+        # ssl.SSLSocket on some platforms doesn't expose setsockopt directly.
+        # Best-effort — connection still works without TCP_NODELAY.
+        _log.debug("TCP_NODELAY not available on this platform — skipping")
+
+    return sock
 
 
 # ── GameWebSocket ─────────────────────────────────────────────────────────────
@@ -1108,33 +1611,65 @@ class GameWebSocket:
             )
         challenge = self._parse_str_frame(challenge_raw)
         ch = json.loads(challenge)
+        _log.debug("CRYPTO_CHALLENGE: %s", challenge)
         if ch.get("version") != CRYPTO_VERSION:
             raise ConnectionError(f"Unsupported crypto version {ch.get('version')}")
 
         # Build CRYPTO_RESPONSE
-        signing_key   = load_signing_key()
-        if signing_key is None:
-            raise RuntimeError("No signing key — run http_login() first")
-
-        ephemeral_key = generate_private_key(SECP256R1())
+        ephemeral_key  = generate_private_key(SECP256R1())
         client_pub_jwk = _ec_pub_to_jwk(ephemeral_key.public_key(), key_ops=[])
         client_nonce   = _b64u_enc(secrets.token_bytes(16))
 
         transcript = _build_transcript(
-            account_id       = ch["accountId"],
-            device_id        = ch["deviceId"],
-            connection_id    = ch["connectionId"],
-            server_nonce     = ch["serverNonce"],
-            client_nonce     = client_nonce,
+            account_id        = ch["accountId"],
+            device_id         = ch["deviceId"],
+            connection_id     = ch["connectionId"],
+            server_nonce      = ch["serverNonce"],
+            client_nonce      = client_nonce,
             server_public_key = ch["serverPublicKey"],
             client_public_key = client_pub_jwk,
         )
+        _log.debug("transcript (%d bytes): %s", len(transcript), transcript.decode())
 
-        # Sign transcript with our persistent ECDSA device key (P1363 format)
-        der_sig  = signing_key.sign(transcript, ec.ECDSA(hashes.SHA256()))
-        r, s     = decode_dss_signature(der_sig)
-        p1363    = r.to_bytes(32, "big") + s.to_bytes(32, "big")
-        sig_b64  = _b64u_enc(p1363)
+        # ── Sign transcript ───────────────────────────────────────────────────
+        # PRIMARY: Ask the Chrome browser to sign using the game's own device key
+        # (window.gm.network.deviceSigningKeyPair.privateKey).  This is the key
+        # the game already registered with the server via Aa(), so the server's
+        # ECDSA verification is guaranteed to match — no key-registration races.
+        #
+        # FALLBACK: If no browser CDP port is stored (non-browser runs), use our
+        # persistent Python signing key from ~/.evilquest/signing_key.json.
+        if _last_cdp_port:
+            try:
+                _log.debug("WS sign: using browser signing (game device key)…")
+                _sig_bytes = await _browser_sign(transcript)
+                sig_b64    = _b64u_enc(_sig_bytes)
+                _log.debug("WS sign: browser signature (first 16): %s", sig_b64[:16])
+            except Exception as _bs_err:
+                _log.warning(
+                    "WS sign: browser signing failed (%s) — falling back to Python key",
+                    _bs_err,
+                )
+                signing_key = load_signing_key()
+                if signing_key is None:
+                    raise RuntimeError("No Python signing key and browser signing failed")
+                _sk_pub = _ec_pub_to_jwk(signing_key.public_key(), key_ops=["verify"])
+                _log.debug("WS sign (fallback): key x=%s y=%s", _sk_pub["x"], _sk_pub["y"])
+                _der   = signing_key.sign(transcript, ec.ECDSA(hashes.SHA256()))
+                _r, _s = decode_dss_signature(_der)
+                sig_b64 = _b64u_enc(_r.to_bytes(32, "big") + _s.to_bytes(32, "big"))
+        else:
+            # No browser available — use local Python key (pre-registered via
+            # http_login / manual POST /api/device-key).
+            signing_key = load_signing_key()
+            if signing_key is None:
+                raise RuntimeError("No signing key — run http_login() first")
+            _sk_pub = _ec_pub_to_jwk(signing_key.public_key(), key_ops=["verify"])
+            _log.debug("WS sign: Python key x=%s y=%s", _sk_pub["x"], _sk_pub["y"])
+            _der   = signing_key.sign(transcript, ec.ECDSA(hashes.SHA256()))
+            _r, _s = decode_dss_signature(_der)
+            sig_b64 = _b64u_enc(_r.to_bytes(32, "big") + _s.to_bytes(32, "big"))
+            _log.debug("WS sign: signature (first 16): %s", sig_b64[:16])
 
         # Derive session keys
         self._keys = _derive_session_keys(
@@ -1150,14 +1685,33 @@ class GameWebSocket:
         self._send_counter = 0
         self._recv_counter = -1
 
+        # ── SubtleCrypto processing delay ────────────────────────────────────
+        # In a real browser the CRYPTO_RESPONSE is assembled asynchronously
+        # after three Web Crypto API calls:
+        #   • crypto.subtle.generateKey (P-256 ECDH ephemeral key pair)
+        #   • crypto.subtle.sign        (ECDSA over the transcript)
+        #   • crypto.subtle.deriveBits  (ECDH shared secret)
+        # Chrome's BoringSSL backend takes 8–50 ms for these on typical hardware
+        # (measured via DevTools performance timeline).  Our synchronous Python
+        # crypto completes in <1 ms, so sending immediately after computation
+        # produces a sub-millisecond challenge→response gap that is trivially
+        # distinguishable from a real browser.
+        #
+        # Lognormal distribution: median ≈ 22 ms, σ_ln = 0.55.
+        # Clamped to [8, 80] ms to match real-world P-256 timing range.
+        _subtle_delay = math.exp(random.gauss(math.log(0.022), 0.55))
+        await asyncio.sleep(max(0.008, min(0.080, _subtle_delay)))
+
         # Send CRYPTO_RESPONSE (plain, not encrypted, client opcode 2)
         response_json = json.dumps({
-            "version":       CRYPTO_VERSION,
-            "clientNonce":   client_nonce,
+            "version":         CRYPTO_VERSION,
+            "clientNonce":     client_nonce,
             "clientPublicKey": client_pub_jwk,
-            "signature":     sig_b64,
+            "signature":       sig_b64,
         }, separators=(",", ":"))
+        _log.debug("CRYPTO_RESPONSE: %s", response_json)
         response_frame = self._build_str_frame(2, response_json)
+        _log.debug("response_frame hex (first 32 bytes): %s", response_frame[:32].hex())
         await self._loop.run_in_executor(
             None, lambda: self._sock.sendall(_ws_encode(response_frame))
         )
@@ -1196,10 +1750,22 @@ class GameWebSocket:
             None, lambda: _read_ws_frame(self._sock)
         )
         if opcode == 9:  # ping → pong
+            # A browser responds to a WebSocket ping in the next event loop tick
+            # after the network event fires.  That's typically 1–16 ms depending
+            # on the browser's event-loop backlog and OS scheduler.  Responding
+            # in the same asyncio tick as the read (zero delay) is a machine-speed
+            # fingerprint — no human-operated browser ever achieves it.
+            # Uniform(1, 15 ms) matches the observed browser pong latency range.
+            await asyncio.sleep(random.uniform(0.001, 0.015))
             await self._send_raw_ws(payload, opcode=10)
             return None
         if opcode == 8:
-            raise ConnectionError("Server sent WebSocket close frame")
+            # Close frame payload: [close_code uint16 BE][optional reason UTF-8]
+            if len(payload) >= 2:
+                close_code = struct.unpack_from(">H", payload)[0]
+                reason = payload[2:].decode("utf-8", errors="replace") if len(payload) > 2 else ""
+                raise ConnectionError(f"Server sent WebSocket close frame: code={close_code} reason={reason!r}")
+            raise ConnectionError("Server sent WebSocket close frame (no code)")
         if opcode not in (1, 2):
             return None
         return payload
