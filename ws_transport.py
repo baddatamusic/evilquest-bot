@@ -69,7 +69,7 @@ import requests
 
 ENC_BYTE_0 = 0xFE   # J = 254  — encrypted frame marker first byte
 ENC_BYTE_1 = 0x02   # H = 2    — protocol version byte
-PROTOCOL_VERSION = 13            # bi = 13 in GameManager-_UxitI8j.js (updated May 2026)
+PROTOCOL_VERSION = 14            # xi = 14 in GameManager-FgV9DF8M.js (updated May 2026)
 CRYPTO_VERSION   = 2             # qe = 2
 OPCODE_MAPPING_VERSION = 1       # bt = 1
 
