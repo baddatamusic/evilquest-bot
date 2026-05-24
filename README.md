@@ -81,6 +81,7 @@ Persistent state is stored in `~/.evilquest/` (device ID, ECDSA signing key, aut
 
 | Version | Date | Summary |
 |---|---|---|
+| **6.1** | May 2026 | `_uptime_loop()` — total runtime logged every 60 s (`UPTIME Xh YYm ZZs`); survives reconnects |
 | **6.0** | May 2026 | `PROTOCOL_VERSION` 12→13 fix (second asset build May 2026); cached-auth 401 detection + auto-clear; `CURSOR_POSITION` opcode 122 + `_cursor_loop()` / `_click_cursor()` (anti-cheat cursor events); `_tick_slip()` P50 raised 25ms→120ms (reaction time floor); version banner; `fetch_latest_js.py` utility — **all known ADMIN_FLAGS addressed** |
 | **5.0** | May 2026 | `PROTOCOL_VERSION` 11→12 fix (server asset update); zero key-registration race (IDB injection + browser-fetch after `Aa()`); cached-auth Python signing for reconnect without Chrome; human-like timing (`_jitter` / `_human_reaction` / `_tick_slip`); ADMIN_FLAGS handler; path suboptimality injection; trade auto-decline; `find_nearby_cows()` — **bot confirmed working end-to-end after server update** |
 | **4.0** | May 2026 | reCAPTCHA v3 bypass via pydoll Chrome CDP; 23 h auth token cache; protocol v3.2 (DUEL removed, CLIENT_POSITION_Y added); Chrome startup reliability fix; woodcutting stand-beside adjacency — **PATH_TRUNCATED eliminated, 2× log rate** |
@@ -92,6 +93,29 @@ Persistent state is stored in `~/.evilquest/` (device ID, ECDSA signing key, aut
 ---
 
 ## Changelog
+
+---
+
+### v6.1 — Uptime timer (May 2026)
+
+#### 6.1.1 `_uptime_loop()` — total runtime logged every 60 s (`bot.py`)
+
+Adds a background task that logs total bot runtime to the console once per minute:
+
+```
+10:01:00  INFO      UPTIME   1m 00s
+10:02:00  INFO      UPTIME   2m 00s
+11:05:00  INFO      UPTIME   1h 05m 00s
+```
+
+**Format:** `Xm YYs` under one hour; `Xh YYm ZZs` once past an hour.
+
+**Implementation notes:**
+
+- Sleeps exactly 60 s per tick (no jitter — it is a clock, not a game action)
+- Uses `_session_start` (set once at first login, never reset on reconnect) so the timer continues uninterrupted across reconnect cycles
+- Separate from the jittered `STATUS` line; `UPTIME` is a clean standalone line without HP/XP/kill stats
+- Task started alongside `_status_loop()`, cancelled in the connection `finally` block
 
 ---
 
