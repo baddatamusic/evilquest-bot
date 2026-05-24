@@ -1827,7 +1827,18 @@ def _select_mode_interactive() -> str:
         print("  Enter 1 or 2.")
 
 
+BOT_VERSION = "V5"
+BOT_AUTHOR  = "Blackberry"
+
+BANNER = f"""
+╔══════════════════════════════════════╗
+║  EvilBot {BOT_VERSION:<6}  by {BOT_AUTHOR:<16}  ║
+╚══════════════════════════════════════╝"""
+
+
 def main():
+    print(BANNER, flush=True)
+
     parser = argparse.ArgumentParser(description="EvilQuest bot")
     parser.add_argument("--username",
                         default=os.environ.get("EVILQUEST_USER"),
