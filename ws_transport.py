@@ -84,30 +84,34 @@ _last_cdp_port: int = int(os.environ.get("EQ_CDP_PORT", 0) or 0)
 # Client-side logical opcodes that ARE in the opcode mapping
 # (all client opcodes except LOGIN=1 and CRYPTO_RESPONSE=2)
 #
-# Removed in latest game update:
+# Removed in an earlier game update, restored in May 2026:
 #   100-105  — DUEL_REQUEST / DUEL_ACCEPT_REQUEST / DUEL_DECLINE /
-#              DUEL_STAKE_ITEM / DUEL_REMOVE_STAKE / DUEL_ACCEPT  (duel system removed)
+#              DUEL_STAKE_ITEM / DUEL_REMOVE_STAKE / DUEL_ACCEPT  (duel system back)
+# Still absent (server deliberately omits for regular players):
 #   121      — CLIENT_ACTIVITY  (removed from client enum entirely)
 _CLIENT_LOGICAL = sorted({
     10, 20, 21, 22, 23, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 44, 45,
-    50, 60, 70, 71, 80, 81, 82, 83, 90, 91, 92, 93, 94, 95, 120, 122,
-    #                                                               ^^^
+    50, 60, 70, 71, 80, 81, 82, 83, 90, 91, 92, 93, 94, 95,
+    100, 101, 102, 103, 104, 105,   # DUEL client opcodes (restored May 2026)
+    120, 122,
+    #    ^^^
     # 122 = CURSOR_POSITION (mouse x/y scaled to [0,1000]); added May 2026
 })
 
 # Server-side logical opcodes that ARE in the opcode mapping
 # (all server opcodes except CRYPTO_CHALLENGE=2 and OPCODE_MAPPING=3)
 #
-# Removed in latest game update:
+# Restored in May 2026 game update (duel system re-added):
 #   96-99, 101-103  — DUEL server opcodes (DUEL_REQUEST_RECEIVED, DUEL_OPEN,
 #                     DUEL_STAKE_UPDATE, DUEL_ACCEPT_STATE, DUEL_CLOSE,
-#                     DUEL_START, DUEL_FINISH)  — duel system removed entirely
+#                     DUEL_START, DUEL_FINISH)
 _SERVER_LOGICAL = sorted({
     1, 10, 11, 12, 21, 22, 23, 24, 25, 26,
     30, 31, 32, 33, 34, 35, 42, 50, 55, 56, 57, 58, 59,
     60, 61, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
     80, 81, 82, 84, 85, 86, 87, 88,
     90, 91, 92, 93, 94, 95,
+    96, 97, 98, 99, 101, 102, 103,   # DUEL server opcodes (restored May 2026)
     100, 110, 111, 121, 122,
     # 120 (ADMIN_FLAGS) removed from mapping — server changed it to an admin-only
     # status opcode (bit 0 = isAdmin) and no longer maps it for regular players.
@@ -1759,7 +1763,17 @@ class GameWebSocket:
         if mapping_plain[0] != 3:
             raise ConnectionError(f"Expected OPCODE_MAPPING (3), got opcode {mapping_plain[0]}")
         mapping_json = self._parse_str_frame(mapping_plain)
-        self._mapping = OpcodeMapping.from_json(json.loads(mapping_json))
+        mapping_obj  = json.loads(mapping_json)
+        self._mapping = OpcodeMapping.from_json(mapping_obj)
+
+        # Diagnostic: log the full server wire→logical table so unknown wire opcodes
+        # can be traced to their logical equivalents if they appear as "Unhandled".
+        _log = logging.getLogger(__name__)
+        if _log.isEnabledFor(logging.DEBUG):
+            server_map = mapping_obj.get("server", {})
+            reverse    = {v: int(k) for k, v in server_map.items()}
+            sorted_pairs = sorted(reverse.items())
+            _log.debug("OPCODE_MAPPING server wire→logical: %s", sorted_pairs)
 
         # A real browser spends several JS event-loop ticks parsing the opcode
         # mapping JSON, scheduling micro-tasks, and updating internal state before

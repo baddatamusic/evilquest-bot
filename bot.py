@@ -579,6 +579,61 @@ class Bot:
             else:
                 log.debug("TRADE_REQUEST_RECEIVED (no entity id in vals)")
 
+        elif op == S.TRADE_OFFER_UPDATE:
+            # Trade partner has changed their offered items — cosmetic only for us
+            # since we never accept trades.  Keep at DEBUG to avoid flood.
+            log.debug(f"TRADE_OFFER_UPDATE vals={vals[:5]}")
+
+        elif op == S.TRADE_OPEN:
+            # Server opened the trade panel (partner accepted our or their request).
+            # We declined the request earlier; this shouldn't normally arrive.
+            partner_eid = vals[0] if vals else "?"
+            log.info(f"TRADE_OPEN partner={partner_eid} — ignoring (no trade logic)")
+
+        elif op == S.TRADE_ACCEPT_STATE:
+            log.debug(f"TRADE_ACCEPT_STATE vals={vals[:3]}")
+
+        elif op == S.TRADE_CLOSE:
+            reason = vals[0] if vals else "?"
+            log.info(f"TRADE_CLOSE reason={reason}")
+
+        elif op == S.DUEL_REQUEST_RECEIVED:
+            # Auto-decline duel requests.  Same reasoning as TRADE_REQUEST_RECEIVED:
+            # a bot that never declines is a detectable social-graph signal.
+            if vals:
+                challenger_eid = vals[0]
+                log.info(f"DUEL_REQUEST_RECEIVED from entity={challenger_eid} — declining")
+                async def _decline_duel(eid: int) -> None:
+                    await asyncio.sleep(_human_reaction())
+                    try:
+                        await self._send(pack(C.DUEL_DECLINE, eid))
+                    except Exception:
+                        pass
+                asyncio.create_task(_decline_duel(challenger_eid))
+            else:
+                log.debug("DUEL_REQUEST_RECEIVED (no entity id)")
+
+        elif op == S.DUEL_OPEN:
+            # Server opened the duel panel — shouldn't happen since we decline.
+            partner_eid = vals[0] if vals else "?"
+            log.warning(f"DUEL_OPEN partner={partner_eid} (unexpected — no duel logic)")
+
+        elif op == S.DUEL_STAKE_UPDATE:
+            log.debug(f"DUEL_STAKE_UPDATE vals={vals[:5]}")
+
+        elif op == S.DUEL_ACCEPT_STATE:
+            log.debug(f"DUEL_ACCEPT_STATE vals={vals[:3]}")
+
+        elif op == S.DUEL_CLOSE:
+            reason = vals[0] if vals else "?"
+            log.info(f"DUEL_CLOSE reason={reason}")
+
+        elif op == S.DUEL_START:
+            log.warning("DUEL_START — bot is in a duel; no duel logic, will time out")
+
+        elif op == S.DUEL_FINISH:
+            log.info(f"DUEL_FINISH vals={vals[:3]}")
+
         elif op == S.ADMIN_FLAGS:
             # Semantics changed (May 2026 update): now an admin-status packet,
             # not an anti-cheat signal.  Bit 0 of vals[0] = isAdmin.
@@ -689,10 +744,9 @@ class Bot:
             if parsed:
                 log.debug(f"{label}: str={parsed[0]!r} vals={parsed[1]}")
             else:
-                if len(vals) >= 6:
-                    log.info(f"UNHANDLED op={op} ({len(vals)} vals) vals={vals[:12]}")
-                else:
-                    log.debug(f"{label}: vals={vals}")
+                # Debug-only — session summary will show aggregated counts at INFO.
+                # Enable DEBUG logging (LOG_LEVEL=DEBUG) to diagnose specific packets.
+                log.debug(f"UNHANDLED {label} ({len(vals)} vals) vals={vals[:12]}")
 
     async def _recv_loop(self):
         while True:

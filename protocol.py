@@ -51,7 +51,12 @@ class C:
     TRADE_OFFER_ITEM     = 93
     TRADE_REMOVE_OFFERED = 94
     TRADE_ACCEPT         = 95
-    # DUEL opcodes 100-105 removed from game (duel system entirely removed)
+    DUEL_REQUEST         = 100   # restored in game update (May 2026)
+    DUEL_ACCEPT_REQUEST  = 101
+    DUEL_DECLINE         = 102
+    DUEL_STAKE_ITEM      = 103
+    DUEL_REMOVE_STAKE    = 104
+    DUEL_ACCEPT          = 105
     CLIENT_PING          = 120
     # CLIENT_ACTIVITY = 121  — removed from opcode map; do NOT send (ValueError)
     CURSOR_POSITION      = 122   # mouse cursor x,y scaled to [0,1000]
@@ -111,8 +116,14 @@ class S:
     TRADE_ACCEPT_STATE     = 93
     TRADE_CLOSE            = 94
     TRADE_TEST_OPEN        = 95
-    # DUEL server opcodes 96-99, 101-103 removed (duel system entirely removed)
+    DUEL_REQUEST_RECEIVED  = 96   # restored in game update (May 2026)
+    DUEL_OPEN              = 97
+    DUEL_STAKE_UPDATE      = 98
+    DUEL_ACCEPT_STATE      = 99
     PATH_TRUNCATED         = 100
+    DUEL_CLOSE             = 101
+    DUEL_START             = 102
+    DUEL_FINISH            = 103
     QUEST_STATE_SYNC       = 110
     QUEST_STAGE_ADVANCED   = 111
     ADMIN_FLAGS            = 120
