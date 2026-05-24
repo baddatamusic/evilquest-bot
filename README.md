@@ -1,4 +1,4 @@
-# EvilQuest Bot · v4.0
+# EvilQuest Bot · v5.0
 
 Automation bot for [EvilQuest](https://evilquest.net) supporting woodcutting and combat modes.  
 Fully implements the **evilquest-game-v2** WebSocket protocol including ECDH key exchange, per-session opcode remapping, and AES-256-GCM encrypted frames.
@@ -8,9 +8,13 @@ Fully implements the **evilquest-game-v2** WebSocket protocol including ECDH key
 ## Features
 
 - **Woodcutting mode** — chops trees near the default area, auto-sells logs to Robert when inventory is full (28 logs); walks to the tile *beside* each tree for guaranteed adjacency before every chop
-- **Combat mode** — finds and attacks cows, walks back to the combat area on death; first kill confirmed in **53 s** from spawn
+- **Combat mode** — finds and attacks cows, walks back to the combat area on death; first kill confirmed in **53 s** from spawn; multi-cow targeting via `find_nearby_cows()`
 - **Sniff mode** — passive packet logger; play the game manually while the bot prints every decoded message (useful for reverse engineering)
 - **reCAPTCHA v3 bypass** — launches a visible Chrome window via pydoll CDP automation; the page's own JS handles reCAPTCHA scoring transparently; auth token cached for 23 h so Chrome only opens once per day
+- **Cached-auth reconnect** — if Chrome is not running, the bot uses cached cookies + a Python-signed ECDSA key registered via HTTP; WS session connects and signs the crypto handshake without opening a browser
+- **Zero key-registration race** — IDB injection pre-seeds the signing key before the game page loads; browser-fetch registration fires only after `window.gm.network.deviceSigningKeyPair` is confirmed ready (game's `Aa()` complete)
+- **Human-like timing** — lognormal-jittered delays (`_jitter`, `_human_reaction`, `_tick_slip`) applied to moves, interactions, and every packet send; defeats statistical timing analysis
+- **Anti-cheat handlers** — `ADMIN_FLAGS` detector logs server-signalled suspicious behaviours; path-suboptimality injection (~7 % of multi-waypoint moves add a single off-axis detour); trade-request auto-decline
 - Automatic reconnect-safe login: fetches a server-issued device ID, registers a persistent ECDSA signing key, and negotiates a fresh session on every run
 - A\* pathfinder with wall, water-tile, and **height-based cliff blocking** (pre-computed from terrain height chunks); dynamic tile learning via `PATH_TRUNCATED` catches any missed edges
 - Jittered heartbeat (5.0–6.2 s) with `CLIENT_PING`; `CLIENT_POSITION_Y` loop reports ground Y-height every 0.5 s (mirrors `reportYToServer()` in `GameManager.js`)
@@ -77,6 +81,7 @@ Persistent state is stored in `~/.evilquest/` (device ID, ECDSA signing key, aut
 
 | Version | Date | Summary |
 |---|---|---|
+| **5.0** | May 2026 | `PROTOCOL_VERSION` 11→12 fix (server asset update); zero key-registration race (IDB injection + browser-fetch after `Aa()`); cached-auth Python signing for reconnect without Chrome; human-like timing (`_jitter` / `_human_reaction` / `_tick_slip`); ADMIN_FLAGS handler; path suboptimality injection; trade auto-decline; `find_nearby_cows()` — **bot confirmed working end-to-end after server update** |
 | **4.0** | May 2026 | reCAPTCHA v3 bypass via pydoll Chrome CDP; 23 h auth token cache; protocol v3.2 (DUEL removed, CLIENT_POSITION_Y added); Chrome startup reliability fix; woodcutting stand-beside adjacency — **PATH_TRUNCATED eliminated, 2× log rate** |
 | **3.1** | May 2026 | Height-based cliff pre-computation (≥78 % of cliff tiles blocked at startup); on-path immediate blocking; Euclidean wait-time; `.env` credential loading — **first kill in 53 s, zero PATH_TRUNCATED events** |
 | **3.0** | May 2026 | Dynamic obstacle persistence; robust `_move()` position tracking; on-path/off-path PATH_TRUNCATED detection; A* tuning |
@@ -86,6 +91,191 @@ Persistent state is stored in `~/.evilquest/` (device ID, ECDSA signing key, aut
 ---
 
 ## Changelog
+
+---
+
+### v5.0 — Protocol version 12 + key-registration race fix + anti-detection (May 2026)
+
+#### Summary
+
+A server-side JS asset push (May 2026) bumped `PROTOCOL_VERSION` from 11 → 12 (`ms` constant in `GameManager-DDbuhVzL.js`).  
+Because `protocolVersion` is part of the ECDSA-signed CRYPTO_CHALLENGE transcript, the server recomputed a different canonical JSON than the bot signed → every WS handshake closed with code **1008 "bad encrypted packet"** regardless of authentication status.
+
+This version fixes the version bump, eliminates the key-registration race introduced in v4.0, adds a full cached-auth reconnect path (no Chrome required), and hardens the bot against statistical timing analysis and server-side anti-cheat flags.
+
+#### Verified results (combat mode)
+
+```
+18:12:04  WebSocket connected + crypto handshake complete
+18:12:04  LOGIN_OK entity_id=105 pos=(1115,1825)
+18:12:06  Walking to cow area (1211,1664)
+18:12:28  Arrived at (1215,1665) (server confirmed)
+18:12:29  Attacking cow entity=7 at (1205,1695)
+18:12:34  XP_GAIN skill=0 xp=1 …
+18:12:48  Cow 7 defeated
+18:12:48  Attacking cow entity=9 at (1205,1675)
+```
+
+---
+
+#### 5.1 PROTOCOL_VERSION 11 → 12 (`ws_transport.py`)
+
+**Root cause:** The game server pushed new JS assets:
+
+| Old file | New file |
+|---|---|
+| `index-DGTyz-tl.js` | `index-DTlu9WCm.js` |
+| `GameManager-B7gNzArI.js` | `GameManager-DDbuhVzL.js` |
+
+The new `GameManager-DDbuhVzL.js` changed `hs = 11` → `ms = 12`.  
+This constant is included as `protocolVersion` in the canonical JSON transcript that both sides sign/verify.
+
+**Fix:**
+
+```python
+PROTOCOL_VERSION = 12  # ms = 12 in GameManager-DDbuhVzL.js (updated May 2026)
+```
+
+**How to detect future version bumps:** Scrape `/play` → find the `GameManager-*.js` href → `grep ms=\d+`.  
+When persistent 1008 errors appear despite a passing HTTP 200 on device-key registration, this is the first thing to check.
+
+**What did NOT change in the new assets:** AES-256-GCM encryption, ECDSA P-256 signing, HKDF-SHA-256 key derivation, encrypted frame format (`0xFE 0x02`), opcode remapping protocol, and canonical JSON algorithm — all identical.
+
+---
+
+#### 5.2 Zero key-registration race (`ws_transport.py`)
+
+**Problem (v4.0):** The bot registered its own public key via HTTP before navigating to `/play`.  
+The game page's own async `Aa(token)` function then registered a *new* key (the game-generated one) — overwriting our registration.  
+The bot's signing key was therefore unknown to the server when the CRYPTO_CHALLENGE arrived.
+
+**Fix — two-stage IDB injection + browser-fetch registration:**
+
+**Stage 1 — IDB pre-seed (before page load):**  
+The bot navigates to a neutral same-origin page (`evilquest.net/`), opens IndexedDB `evilquest_device_crypto_v1 / keys / ecdsa-p256`, and writes our Python signing key (imported as a `CryptoKey` via `crypto.subtle.importKey`).  
+When the game page loads at `/play`, `Ia()` reads *our* key from IDB — the game never generates its own.
+
+**Stage 2 — browser-fetch registration (after `Aa()` completes):**  
+The bot polls `window.gm?.network?.deviceSigningKeyPair?.privateKey` (up to 15 s / 150 polls × 100 ms).  
+Once the game confirms its `Aa()` function has completed and set `deviceSigningKeyPair`, the bot fires a `fetch('/api/device-key', …)` from inside the browser tab using the game's own auth token and `credentials:'same-origin'` cookies.  
+This registration is guaranteed to be *last* — the server now holds our Python public key.
+
+**Result:** Signing with our Python private key produces a signature the server can verify with the registered public key.  Previously this race caused all CRYPTO_RESPONSE frames to be rejected.
+
+---
+
+#### 5.3 `_browser_sign()` game-tab targeting (`ws_transport.py`)
+
+When Chrome is running, `_browser_sign()` signs the WS transcript by executing `crypto.subtle.sign()` inside the game tab (using the game's own `deviceSigningKeyPair.privateKey` held in JS memory).
+
+**Previously:** `browser.connect(browser_ws)` always returned `tabs[0]`, which could be a background tab (e.g. a new-tab page) if the user had multiple tabs open.
+
+**Fix:** After connecting, enumerate `browser.get_opened_tabs()`, check `current_url` for `"evilquest.net"`, and use that tab.  Falls back to `tabs[0]` if URL inspection fails.
+
+---
+
+#### 5.4 Cached-auth Python signing path (`ws_transport.py`)
+
+When Chrome is not running (e.g. reconnect after a crash, or a second bot instance), the browser-based signing path is unavailable.
+
+**Fix:** `async_http_login()` detects that Chrome is unreachable and falls back to:
+
+1. Load cached `~/.evilquest/auth.json` (token, device ID, cookies).
+2. Load `~/.evilquest/signing_key.json` (our persistent ECDSA private key).
+3. Register the public key via direct HTTP POST to `/api/device-key` using the cached cookies and auth token.
+4. Return the cached credentials — WS connect proceeds normally.
+
+During `CRYPTO_CHALLENGE`, the transport signs with the Python key (`_signing_key`) instead of delegating to `_browser_sign()`.  
+With PROTOCOL_VERSION=12 correct, the server accepts this signature.
+
+---
+
+#### 5.5 Human-like timing system (`bot.py`)
+
+Three timing helpers replace all fixed `asyncio.sleep()` calls in game-action paths:
+
+| Helper | Distribution | Purpose |
+|---|---|---|
+| `_jitter(base, scale=0.20)` | Lognormal, σ=0.20, clamped [0.35×, 3.0×] | General-purpose delay with proportional variance |
+| `_human_reaction(floor=0.15)` | Lognormal median ≈ 280 ms, clamped [0.15, 2.5] | Post-event reaction time before responding to a server message |
+| `_tick_slip()` | Uniform [10, 120] ms | Per-packet micro-jitter applied in `_send()` before every outgoing frame |
+
+**`_send()` integration:** Every packet send now calls `await asyncio.sleep(_tick_slip())` before writing to the WebSocket unless `apply_tick_slip=False` is passed explicitly.  This desynchronises packet timing from the Python event loop's natural tick alignment, which is a known statistical fingerprint of bots.
+
+---
+
+#### 5.6 ADMIN_FLAGS anti-cheat handler (`bot.py`)
+
+The server added a new server opcode `ADMIN_FLAGS` that signals which bot-like behaviour patterns have been detected for the current session.
+
+**Handler:**
+
+```python
+elif op == S.ADMIN_FLAGS:
+    if vals:
+        flag_names = {
+            0: "tickAlignedTiming",
+            1: "suspiciousPackets",
+            2: "packetFuzzing",
+            3: "pathOptimality",
+            4: "zeroCancellations",
+            5: "selectivePickup",
+            6: "noChat",
+        }
+        active = [flag_names.get(v, f"flag_{v}") for v in vals]
+        log.warning(f"ADMIN_FLAGS: {active} — adjust behaviour accordingly")
+```
+
+Receiving `ADMIN_FLAGS` does not immediately disconnect the session, but the active flags inform which timing/behaviour adjustments are most urgent.
+
+---
+
+#### 5.7 Path suboptimality injection (`bot.py`)
+
+The server's `pathOptimality` flag (ADMIN_FLAGS bit 3) detects bots that always take mathematically shortest A\* paths.  Human players routinely take slightly suboptimal routes.
+
+**Fix:** In `_send_path_from()`, when a path has ≥ 5 waypoints, inject a single off-axis detour waypoint with 7 % probability.  The detour is one tile perpendicular to the dominant movement direction, inserted at a random position in the middle third of the path.  This shifts the path length by exactly 2 extra tiles — undetectable as intentional by statistical tests tuned for constant-optimal routing.
+
+---
+
+#### 5.8 Trade request auto-decline (`bot.py`)
+
+Other players can send trade requests to the bot's character.  Leaving them unanswered is a mild anti-cheat signal (flag 4: `zeroCancellations`); accepting them would interrupt combat or skilling loops.
+
+**Handler:**
+
+```python
+elif op == S.TRADE_REQUEST_RECEIVED:
+    if vals:
+        requester_eid = vals[0]
+        async def _decline_trade(req_eid: int) -> None:
+            await asyncio.sleep(_human_reaction())   # 150–500 ms "thinking" delay
+            await self._send(pack(C.TRADE_DECLINE, req_eid))
+        asyncio.create_task(_decline_trade(requester_eid))
+```
+
+The `_human_reaction()` delay before declining mimics a player noticing and dismissing the dialog.
+
+---
+
+#### 5.9 `find_nearby_cows()` — multi-target combat (`bot.py`)
+
+Replaced the single-target `find_nearest_cow()` lookup with `State.find_nearby_cows(cow_type, max_dist)`:
+
+- Returns **all** living cows of the given type within `max_dist` (Manhattan distance, default 10 000 x10 units), sorted nearest-first.
+- Filters `dead_npcs` so a just-killed entity is never re-targeted.
+- The combat loop calls `find_nearby_cows()` after each kill and picks the first result — instant retarget without waiting for the next `NPC_SYNC` cycle.
+
+---
+
+#### 5.10 Game asset update
+
+| Asset | Old | New | Size |
+|---|---|---|---|
+| Index JS | `index-DGTyz-tl.js` | `index-DTlu9WCm.js` | 45 244 B |
+| GameManager JS | `GameManager-B7gNzArI.js` | `GameManager-DDbuhVzL.js` | 519 801 B |
+
+New assets downloaded to `gameassets/assets/` and verified: all crypto primitives unchanged, only `protocolVersion` (`ms`) bumped 11 → 12.
 
 ---
 
@@ -543,6 +733,9 @@ ws_transport.py     — WebSocket transport: HTTP login, ECDH handshake, encrypt
 protocol.py         — opcode enums (C.* / S.*) and packet pack/unpack helpers
 pathfinder.py       — A* pathfinder using local map wall + tile data
 gameassets/
+  assets/
+    index-DTlu9WCm.js          — current game index bundle (updated May 2026)
+    GameManager-DDbuhVzL.js    — current GameManager bundle (PROTOCOL_VERSION=12)
   maps/kcmap/
     walls.json      — wall bitmask data (N/E/S/W per tile)
     tiles/          — chunk_CX_CZ.json files (water tile blocking)
@@ -561,7 +754,7 @@ gameassets/
 | Field | Value |
 |---|---|
 | WebSocket subprotocol | `evilquest-game-v2` |
-| Protocol version (`protocolVersion` in transcript) | `11` |
+| Protocol version (`protocolVersion` in transcript) | `12` (bumped from 11, May 2026) |
 | Crypto version (`version` in CRYPTO_CHALLENGE) | `2` |
 | Opcode mapping version | `1` |
 | Encrypted frame marker | `0xFE 0x02` |

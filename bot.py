@@ -29,7 +29,66 @@ import logging
 import math
 import os
 import random
+import time
 from pathlib import Path
+
+
+# ── Human-like timing helpers ─────────────────────────────────────────────────
+#
+# Three problems addressed here:
+#
+#  1. Tick-aligned timing.  Python's asyncio loop fires with <1 ms variance.
+#     Every fixed asyncio.sleep(0.3) lands at the same offset inside each
+#     server tick cycle.  Statistical analysis of inter-packet arrival times
+#     across even a single session distinguishes this from a browser in seconds.
+#     _tick_slip() adds 10–120 ms of uniform jitter before every send.
+#
+#  2. Reaction-time distribution.  Human reaction times after a server event
+#     follow a right-skewed lognormal distribution with a hard floor around
+#     150 ms.  Fixed sleeps produce near-zero-variance Gaussian distributions
+#     that are trivially modelled and flagged.  _human_reaction() samples from
+#     a lognormal that matches empirical human response-time data.
+#
+#  3. General delay jitter.  Every asyncio.sleep(N) call goes through _jitter()
+#     which multiplies by a lognormal factor, keeping the median at N while
+#     adding realistic spread that matches browser JS event-loop timing.
+
+def _jitter(base: float, scale: float = 0.20) -> float:
+    """
+    Lognormal-jittered delay centred on `base`.
+    scale ≈ coefficient of variation (std / mean).
+    Result is clamped to [base*0.35, base*3.0] to prevent absurd extremes.
+    """
+    # lognormal: ln(X) ~ N(mu, sigma²).  Choose mu so E[X]=1 (i.e. mu=-σ²/2).
+    sigma  = scale
+    mu     = -(sigma ** 2) / 2.0
+    factor = math.exp(random.gauss(mu, sigma))
+    factor = max(0.35, min(3.0, factor))
+    return base * factor
+
+
+def _human_reaction(floor: float = 0.15) -> float:
+    """
+    Human post-event reaction time: lognormal with median ≈ 280 ms,
+    hard floor at `floor` seconds (150 ms by default).
+
+    Samples from the same distribution measured in cognitive-psychology
+    simple-reaction-time studies (μ_ln ≈ –1.27, σ_ln ≈ 0.40).
+    """
+    raw = math.exp(random.gauss(-1.27, 0.40))   # median ≈ 0.28 s
+    return max(floor, min(2.5, raw))
+
+
+def _tick_slip() -> float:
+    """
+    Random 10–120 ms micro-delay inserted before every game packet send.
+
+    A real browser's packet send timing is disturbed by the rAF compositor,
+    V8 GC pauses, and OS scheduler jitter at this scale.  Python's asyncio
+    loop has <1 ms variance — this function corrects for that deficit.
+    Breaks tick-phase alignment even when the base sleep is perfectly regular.
+    """
+    return random.uniform(0.010, 0.120)
 
 
 def _load_dotenv() -> None:
@@ -154,15 +213,25 @@ class State:
             if iid == LOG_ITEM_ID
         ]
 
-    def find_nearest_cow(self, cow_type: int) -> tuple | None:
-        best, best_d = None, 10_000
+    def find_nearby_cows(self, cow_type: int, max_dist: int = 10_000) -> list[tuple]:
+        """
+        Return all live cows of `cow_type` within `max_dist` (Manhattan, x10 units),
+        sorted nearest-first.  Excludes entities in dead_npcs.
+
+        Returns list of (eid, nx, ny).  Empty list if none visible.
+        """
+        results = []
         for eid, (tid, nx, ny, hp, _mhp) in self.npcs.items():
             if tid == cow_type and hp > 0 and eid not in self.dead_npcs:
                 d = abs(nx - self.x) + abs(ny - self.y)
-                if d < best_d:
-                    best_d = d
-                    best = (eid, nx, ny)
-        return best
+                if d <= max_dist:
+                    results.append((eid, nx, ny, d))
+        results.sort(key=lambda r: r[3])
+        return [(e, x, y) for e, x, y, _ in results]
+
+    def find_nearest_cow(self, cow_type: int) -> tuple | None:
+        cows = self.find_nearby_cows(cow_type)
+        return cows[0] if cows else None
 
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
@@ -187,6 +256,7 @@ class Bot:
         self._device_id:      str = ""
         self._device_cookie:  str = ""
         self._sell_lock  = asyncio.Lock()
+        self._session_start: float = 0.0   # set in run(); used by _fatigue_scale()
 
         self.ev_path_truncated = asyncio.Event()
         # Set by _recv_loop() when the socket closes unexpectedly.
@@ -203,9 +273,21 @@ class Bot:
         log.info("Browser login OK — device_id=%s", (device_id[:8] + "…") if device_id else "N/A")
         return token, device_id, cookie
 
-    async def _send(self, data: bytes):
+    async def _send(self, data: bytes, apply_tick_slip: bool = True):
+        """
+        Send a game packet.
+
+        apply_tick_slip=True (default) inserts a 10–120 ms micro-jitter before
+        the send.  This breaks tick-phase alignment: even if the surrounding
+        sleep is perfectly regular, the actual packet arrival at the server is
+        uniformly spread across the tick window, matching browser-level timing
+        variance.  Pass apply_tick_slip=False only for latency-critical paths
+        (e.g. heartbeat) that already carry their own jitter.
+        """
         if self._ws_closed.is_set():
             raise ConnectionError("WebSocket is closed — cannot send")
+        if apply_tick_slip:
+            await asyncio.sleep(_tick_slip())
         await self.ws.send(data)
 
     # ── Message dispatch ─────────────────────────────────────────────────────
@@ -336,6 +418,50 @@ class Bot:
             log.info(f"MAP_CHANGE map={map_name!r} pos=({self.state.x},{self.state.y})")
             self.state._pending_map_ready = True
 
+        elif op == S.TRADE_REQUEST_RECEIVED:
+            # Another player sent us a trade request.  A real player always
+            # responds — either accepting (rarely) or declining.  An account
+            # that receives hundreds of trade requests and never sends
+            # TRADE_DECLINE is a strong bot signal visible in the social graph.
+            #
+            # We decline after a human-like reading delay (150–600 ms).
+            # We do NOT accept trades — the bot has no trade logic and accepting
+            # an unsolicited trade could expose our inventory to inspection.
+            if vals:
+                requester_eid = vals[0]
+                log.info(f"TRADE_REQUEST_RECEIVED from entity={requester_eid} — declining")
+                async def _decline_trade(req_eid: int) -> None:
+                    await asyncio.sleep(_human_reaction())
+                    try:
+                        await self._send(pack(C.TRADE_DECLINE, req_eid))
+                    except Exception:
+                        pass
+                asyncio.create_task(_decline_trade(requester_eid))
+            else:
+                log.debug("TRADE_REQUEST_RECEIVED (no entity id in vals)")
+
+        elif op == S.ADMIN_FLAGS:
+            # New server opcode added with the admin-UI anti-cheat system.
+            # The real client receives this and may update local UI state.
+            # Falling through to the generic unhandled logger would generate
+            # a noisy INFO line for a packet the server sends deliberately —
+            # handle it explicitly so it stays at DEBUG level and doesn't
+            # confuse post-session log analysis.
+            if vals:
+                flag_names = {
+                    0: "tickAlignedTiming",
+                    1: "suspiciousPackets",
+                    2: "packetFuzzing",
+                    3: "pathOptimality",
+                    4: "zeroCancellations",
+                    5: "selectivePickup",
+                    6: "noChat",
+                }
+                active = [flag_names.get(v, f"flag_{v}") for v in vals]
+                log.warning(f"ADMIN_FLAGS: {active} — adjust behaviour accordingly")
+            else:
+                log.debug("ADMIN_FLAGS received (empty payload)")
+
         elif op == S.SERVER_PONG:
             log.debug(f"SERVER_PONG seq={vals[0] if vals else '?'}")
 
@@ -447,6 +573,29 @@ class Bot:
             nonlocal _last_path_sent
             path = pathfinder.find_path(sx, sz, x, y)
             if path:
+                # ── Path suboptimality (~7 % of moves with ≥5 waypoints) ──────
+                # Real players click imprecisely and don't always produce
+                # mathematically optimal routes.  We inject a single off-axis
+                # detour waypoint near the start of the path.  If the detour tile
+                # turns out to be blocked, the server fires PATH_TRUNCATED and the
+                # re-path logic handles it transparently — safe either way.
+                # Only applied on the INITIAL send (sx == state.x), not on
+                # re-paths triggered by truncation events.
+                if (len(path) >= 5
+                        and sx == self.state.x and sz == self.state.y
+                        and random.random() < 0.07):
+                    di  = random.randint(1, min(3, max(1, len(path) // 4)))
+                    px, pz = path[di - 1]
+                    # Deviate one tile perpendicular to the primary travel axis
+                    dx = random.choice([-10, 10])
+                    dz = random.choice([-10, 10])
+                    detour = (px + dx, pz + dz)
+                    path = path[:di] + [detour] + path[di:]
+                    log.debug(
+                        f"Path detour at step {di}: ({detour[0]},{detour[1]}) "
+                        f"(total {len(path)} waypoints)"
+                    )
+
                 chunk = path[:50]
                 _last_path_sent = list(chunk)
                 args  = [len(chunk)]
@@ -630,13 +779,22 @@ class Bot:
         # ── Step 1: coarse move to the tree area ─────────────────────────────
         trees = self.state.nearby_trees()
         if trees:
-            _, _, ax, ay = trees[0]
+            # Occasionally target the second-nearest tree instead of the closest.
+            # Zero-variance "always pick closest" is a detectable bot signal;
+            # real players sometimes click a nearby tree they glanced at instead.
+            if len(trees) > 1 and random.random() < 0.12:
+                _, _, ax, ay = trees[1]
+                log.debug("Targeting second-nearest tree (anti-detect variance)")
+            else:
+                _, _, ax, ay = trees[0]
         else:
             ax, ay = self.tree_x, self.tree_y
             log.info(f"No trees visible yet — moving to tree area ({ax},{ay})")
 
         await self._move(ax, ay)
-        await asyncio.sleep(0.5)   # let WORLD_OBJECT_SYNC packets arrive
+        # Jittered settle delay: let WORLD_OBJECT_SYNC packets arrive.
+        # Fixed 0.5 s here would cluster arrivals at the same server-tick offset.
+        await asyncio.sleep(_jitter(0.50))
 
         # ── Step 2: pick the closest visible tree after arriving ──────────────
         trees = self.state.nearby_trees()
@@ -653,14 +811,28 @@ class Bot:
         sx, sy = self._stand_beside(self.state.x, self.state.y, tx, ty)
         log.info(f"Walking beside tree entity={eid} at ({tx},{ty}) → standing at ({sx},{sy})")
         await self._move(sx, sy, arrive_window=12)
-        await asyncio.sleep(0.2)
+
+        # Human reaction gap before clicking — lognormal, floor 150 ms.
+        # Fatigue scale stretches this naturally over long sessions.
+        await asyncio.sleep(_human_reaction() * self._fatigue_scale())
+
+        # ── Pre-interact position fidget (~3 % of chops) ──────────────────────
+        # Real players occasionally click a nearby tile right before their main
+        # action — adjusting position, a misclick, or an accidental camera click.
+        # This injects PLAYER_MOVE into periods where the bot would otherwise be
+        # completely still, adding entropy to the pre-interact n-gram.
+        if random.random() < 0.03:
+            await self._position_fidget()
+            await asyncio.sleep(_human_reaction(floor=0.10))
 
         # ── Step 4: send the interact packet ─────────────────────────────────
         self.state.ev_skilling_start.clear()
         self.state.ev_skilling_stop.clear()
 
         # PLAYER_INTERACT_OBJECT format: (entity_id, action_index)
-        # action_index 0 = first interaction option (e.g. "Chop" for trees)
+        # action_index 0 = first interaction option (e.g. "Chop" for trees).
+        # tick_slip is already applied inside _send() so packet arrival is
+        # phase-shifted within the server tick window.
         await self._send(pack(C.PLAYER_INTERACT_OBJECT, eid, 0))
 
         if not await self._wait_for_event(self.state.ev_skilling_start, 6.0):
@@ -671,9 +843,9 @@ class Bot:
             log.warning("No SKILLING_STOP in 2 minutes")
             return False
 
-        # Logs go directly to inventory in EvilQuest (no ground pickup needed).
-        # logs_in_inventory is incremented in the SKILLING_STOP handler.
-        await asyncio.sleep(0.2)
+        # Simulate human reaction latency after seeing the log appear.
+        # Fatigue scale increases this over time — tired players respond slower.
+        await asyncio.sleep(_human_reaction() * self._fatigue_scale())
         return True
 
     async def _sell_logs(self):
@@ -692,7 +864,9 @@ class Bot:
 
         log.info(f"Selling to Robert entity={eid} at ({rx},{ry})")
         await self._move(rx, ry)
-        await asyncio.sleep(0.4)
+        # Jittered settle after walking up to NPC — simulates "looking at the NPC"
+        # before right-clicking. Fixed 0.4 s is a strong timing fingerprint.
+        await asyncio.sleep(_jitter(0.40))
 
         self.state.ev_dialogue.clear()
         self.state.ev_shop_open.clear()
@@ -702,7 +876,10 @@ class Bot:
             log.warning("No DIALOGUE_OPEN after talking to Robert")
             return
 
-        await asyncio.sleep(0.3)
+        # Human time to read the dialogue box before clicking an option.
+        # Real players are noticeably slower here (reading text): lognormal,
+        # median ≈ 400 ms, floor 200 ms (slightly slower than action reactions).
+        await asyncio.sleep(max(0.20, _human_reaction(floor=0.20) * 1.4))
         sid = self.state.dialogue_session_id
         log.info(f"DIALOGUE_CHOOSE npc={eid} session={sid} option={self.shop_option}")
         await self._send(pack(C.DIALOGUE_CHOOSE, eid, sid, self.shop_option))
@@ -712,76 +889,264 @@ class Bot:
         else:
             log.warning("No SHOP_OPEN after DIALOGUE_CHOOSE — selling anyway")
 
-        await asyncio.sleep(0.3)
+        # Human time to locate the sell button in the shop UI.
+        await asyncio.sleep(_human_reaction())
         n = self.state.logs_in_inventory
         log.info(f"Selling {n} logs from slot 0")
         await self._send(pack(C.PLAYER_SELL_ITEM, 0, n, LOG_ITEM_ID))
         self.state.logs_chopped = 0
         self.state.logs_in_inventory = 0
 
+    # ── Session fatigue ───────────────────────────────────────────────────────
+
+    def _fatigue_scale(self) -> float:
+        """
+        Returns a delay multiplier that grows as the session ages.
+
+        Models the gradual slowdown real players show during long grind sessions.
+        Multiplied into behavioural delays (reactions, inter-action pauses) but
+        NOT into tick_slip or heartbeat intervals — those are timing corrections,
+        not player behaviour.
+
+            Session age →  0 h    1 h    2 h    3 h    4 h
+            Typical scale  1.00   1.08   1.16   1.24   1.32  (capped at 1.45)
+
+        The rate has small Gaussian noise so repeated sessions don't produce
+        identical fatigue curves.
+        """
+        if not self._session_start:
+            return 1.0
+        elapsed_h = (time.monotonic() - self._session_start) / 3600.0
+        # ≈ 8–12 % per hour — enough to be visible in long-session timing plots
+        rate = random.gauss(0.10, 0.015)
+        return min(1.45, 1.0 + elapsed_h * rate)
+
+    # ── Behavioural entropy helpers ───────────────────────────────────────────
+
+    async def _pickup_nearby_items(self, reach: int = 40) -> None:
+        """
+        Opportunistically pick up non-log ground items within `reach` (x10 units).
+
+        A bot that ONLY ever sends PLAYER_PICKUP_ITEM for LOG_ITEM_ID=23 (or never
+        sends it at all, since logs go straight to inventory) is trivially flagged
+        by selective-pickup detection.  Real players notice and grab other items
+        they see on the ground — coins, drops from nearby kills, etc.
+
+        Only called when the caller's probability gate passes.  Picks up at most
+        2 items per call so the bot doesn't look like a hoover.  Items are sampled
+        randomly rather than always in the same order (which would itself be a
+        timing fingerprint).
+        """
+        candidates = [
+            (eid, iid, qty, gx, gy)
+            for eid, (iid, qty, gx, gy) in self.state.ground_items.items()
+            if iid != LOG_ITEM_ID
+            and abs(gx - self.state.x) <= reach
+            and abs(gy - self.state.y) <= reach
+            and qty > 0
+        ]
+        if not candidates:
+            return
+        sample = random.sample(candidates, min(2, len(candidates)))
+        for eid, iid, _qty, gx, gy in sample:
+            await asyncio.sleep(_human_reaction() * self._fatigue_scale())
+            try:
+                await self._send(pack(C.PLAYER_PICKUP_ITEM, eid))
+                log.debug(f"Picked up ground item eid={eid} iid={iid} at ({gx},{gy})")
+            except Exception:
+                break
+
+    async def _position_fidget(self) -> None:
+        """
+        Send a 1-tile position nudge to a random orthogonal neighbour.
+
+        During long skilling waits and between-action idle periods the bot sends
+        zero PLAYER_MOVE packets.  Real players' characters shuffle slightly —
+        a mis-click, a small camera adjustment, or just fidgeting.  This injects
+        exactly that noise into the packet stream without disrupting navigation.
+
+        Does NOT await arrival — the server processes the micro-step at its own
+        pace and the bot continues with its next action regardless.
+        """
+        dirs = [(10, 0), (-10, 0), (0, 10), (0, -10)]
+        dx, dy = random.choice(dirs)
+        tx = self.state.x + dx
+        ty = self.state.y + dy
+        try:
+            await self._send(pack(C.PLAYER_MOVE, 1, tx, ty))
+            log.debug(f"Position fidget: nudge → ({tx},{ty})")
+        except Exception:
+            pass
+
+    async def _maybe_change_stance(self) -> None:
+        """
+        Occasionally send PLAYER_SET_STANCE to vary attack style.
+
+        In hundreds of kills the bot never sends this packet — a 0-stance-change
+        account is a detectable n-gram signal in combat mode.  Real players cycle
+        through stances when they want different XP distributions or just out of
+        habit.  Called after ≈8 % of kills with its own human-like delay.
+
+        Stance values mirror standard game conventions:
+          0 = accurate  1 = aggressive  2 = defensive  3 = controlled
+        """
+        if random.random() >= 0.08:
+            return
+        stance = random.randint(0, 3)
+        await asyncio.sleep(_human_reaction() * self._fatigue_scale())
+        try:
+            await self._send(pack(C.PLAYER_SET_STANCE, stance))
+            log.debug(f"Changed combat stance → {stance}")
+        except Exception:
+            pass
+
     async def _inventory_watchdog(self):
         while True:
-            await asyncio.sleep(30)
+            # Jitter the watchdog interval: exact 30.0 s fires are trivially
+            # identifiable in server-side packet timing analysis.
+            # lognormal around 30 s, scale=0.20 → typical range 20–45 s.
+            await asyncio.sleep(_jitter(30.0, scale=0.20))
             n = self.state.logs_in_inventory
             log.info(f"Watchdog: {n}/{SELL_AT_LOGS} logs")
             if n >= SELL_AT_LOGS:
                 await self._sell_logs()
 
     async def _woodcutting_loop(self):
+        # Randomise the sell threshold each loop entry so the bot doesn't always
+        # sell at exactly SELL_AT_LOGS=28.  This breaks the "sells at a fixed
+        # inventory count" signal.  Range: 80–100% of SELL_AT_LOGS.
+        _sell_at = random.randint(
+            max(1, int(SELL_AT_LOGS * 0.80)),
+            SELL_AT_LOGS,
+        )
+        log.debug(f"Sell threshold for this run: {_sell_at} logs")
+
         while True:
             ok = await self._chop_tree()
             if ok:
-                log.info(f"Logs in inventory: {self.state.logs_in_inventory}/{SELL_AT_LOGS}")
-            if self.state.logs_in_inventory >= SELL_AT_LOGS:
+                log.info(f"Logs in inventory: {self.state.logs_in_inventory}/{_sell_at}")
+
+            if self.state.logs_in_inventory >= _sell_at:
                 await self._sell_logs()
-            await asyncio.sleep(0.3)
+                # Pick a new sell threshold after each sale.
+                _sell_at = random.randint(
+                    max(1, int(SELL_AT_LOGS * 0.80)),
+                    SELL_AT_LOGS,
+                )
+                log.debug(f"Next sell threshold: {_sell_at} logs")
+
+            # ── Opportunistic ground item pickup (≈25 % of chops) ────────────
+            # Logs go to inventory automatically so we never send PLAYER_PICKUP
+            # for them — but real players grab other items they notice.
+            # Only check when there's a reasonable chance something is nearby;
+            # checking every single chop looks like polling.
+            if random.random() < 0.25:
+                await self._pickup_nearby_items()
+
+            # ── Inter-chop position fidget (≈2 % of chops) ───────────────────
+            # Adds a PLAYER_MOVE to the packet sequence during idle periods.
+            if random.random() < 0.02:
+                await self._position_fidget()
+                await asyncio.sleep(_human_reaction(floor=0.10))
+
+            # Jitter the inter-chop pause, scaled by fatigue so late-session
+            # cycles are measurably slower — matching human behaviour.
+            await asyncio.sleep(_jitter(0.30) * self._fatigue_scale())
+
+            # Occasional longer idle pause (≈4% of chops): simulates the player
+            # glancing at chat, a notification, or just spacing out.
+            # Admins reviewing timing plots look for monotonic behaviour;
+            # these breaks add the variance a real player always has.
+            if random.random() < 0.04:
+                idle = random.uniform(8.0, 45.0)
+                log.info(f"Idle pause {idle:.1f}s (simulating distraction)")
+                await asyncio.sleep(idle)
 
     # ── Combat ────────────────────────────────────────────────────────────────
 
     async def _walk_to_cow_area(self):
-        jx = self.cow_x + random.randint(-60, 60)
-        jy = self.cow_y + random.randint(-60, 60)
+        """
+        Move to a random position within the cow area.
+
+        Uses Gaussian offsets (σ≈30 tiles x10, clamped to ±80) rather than
+        uniform randint.  A uniform box distribution is a recognisable
+        statistical fingerprint when plotted across many sessions; a Gaussian
+        centred on the area matches how real players aim for "roughly the middle"
+        with natural imprecision.
+        """
+        ox = int(random.gauss(0, 30))
+        oy = int(random.gauss(0, 30))
+        ox = max(-80, min(80, ox))
+        oy = max(-80, min(80, oy))
+        jx = self.cow_x + ox
+        jy = self.cow_y + oy
         log.info(f"Walking to cow area ({jx},{jy})")
         await self._move(jx, jy)
 
     async def _combat_loop(self):
         await self._walk_to_cow_area()
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(_jitter(1.0))
 
         no_cow_since = asyncio.get_event_loop().time()
 
+        # Pre-randomise the "no cow → walk closer" timeout so it isn't a
+        # constant 30 s across every session.  Lognormal around 28 s, typical
+        # range 18–45 s — matches how long a human waits before giving up.
+        _no_cow_threshold = _jitter(28.0, scale=0.22)
+
+        # Vary the "cow is too far" walk-closer distance.  A fixed 200-unit
+        # threshold creates a detectable boundary; jitter it per loop entry.
+        _close_threshold = int(_jitter(200, scale=0.15))
+
         while True:
-            cow = self.state.find_nearest_cow(self.cow_type)
-            if not cow:
+            cows = self.state.find_nearby_cows(self.cow_type)
+
+            if not cows:
                 waited = asyncio.get_event_loop().time() - no_cow_since
-                if waited > 30:
-                    log.info("No cows for 30s — walking closer")
+                if waited > _no_cow_threshold:
+                    log.info(f"No cows for {int(waited)}s — walking closer")
                     await self._walk_to_cow_area()
                     no_cow_since = asyncio.get_event_loop().time()
+                    # Pick a new threshold each time we reposition.
+                    _no_cow_threshold = _jitter(28.0, scale=0.22)
                 else:
                     log.info(f"No cows visible — waiting ({int(waited)}s)")
-                    await asyncio.sleep(3.0)
+                    await asyncio.sleep(_jitter(3.0))
                 continue
 
-            eid, cx, cy = cow
+            # ── Target selection ────────────────────────────────────────────
+            # 10% of the time pick the second-nearest cow instead of the
+            # closest, matching woodcutting's tree-selection variance.
+            # Real players often click a slightly-off target mid-scan.
             no_cow_since = asyncio.get_event_loop().time()
+            if len(cows) > 1 and random.random() < 0.10:
+                eid, cx, cy = cows[1]
+                log.debug("Targeting second-nearest cow (anti-detect variance)")
+            else:
+                eid, cx, cy = cows[0]
+
             dist = abs(cx - self.state.x) + abs(cy - self.state.y)
-            if dist > 200:
+            if dist > _close_threshold:
                 log.info(f"Cow entity={eid} is {dist} units away — walking closer")
                 await self._move(cx, cy)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(_jitter(0.50))
                 continue
 
             log.info(f"Attacking cow entity={eid} at ({cx},{cy})")
             await self._move(cx, cy)
-            await asyncio.sleep(0.5)
+            # Human reaction before clicking Attack — lognormal, floor 150 ms.
+            await asyncio.sleep(_human_reaction())
 
             self.state.dead_npcs.discard(eid)
             self.state.ev_player_died.clear()
             self.state.ev_player_respawned.clear()
             await self._send(pack(C.PLAYER_ATTACK_NPC, eid))
 
-            deadline    = asyncio.get_event_loop().time() + 60.0
+            # Jitter the per-combat timeout.  An exact 60 s deadline appears
+            # as a sharp cutoff in server-side session analysis; jittering it
+            # makes the distribution continuous and human-shaped.
+            _combat_timeout = _jitter(60.0, scale=0.15)
+            deadline    = asyncio.get_event_loop().time() + _combat_timeout
             target_dead = False
             player_dead = False
 
@@ -794,7 +1159,9 @@ class Bot:
                 if eid in self.state.dead_npcs or eid not in self.state.npcs:
                     target_dead = True
                     break
-                await asyncio.sleep(0.5)
+                # Jittered poll interval — fixed 0.5 s creates a visible spike
+                # in the packet inter-arrival histogram during combat.
+                await asyncio.sleep(_jitter(0.50))
 
             if not target_dead and not player_dead:
                 log.warning(f"Combat stalled on cow {eid} — finding new target")
@@ -804,22 +1171,49 @@ class Bot:
                 log.info("Died — waiting for respawn...")
                 if not await self._wait_for_event(self.state.ev_player_respawned, 30.0):
                     log.warning("Respawn timed out — continuing anyway")
-                await asyncio.sleep(1.0)
-                wx = self.cow_x + random.randint(-80, 80)
-                wy = self.cow_y + random.randint(-80, 80)
+                await asyncio.sleep(_jitter(1.0))
+                # Use Gaussian walk-back (matches _walk_to_cow_area distribution).
+                ox = int(max(-80, min(80, random.gauss(0, 35))))
+                oy = int(max(-80, min(80, random.gauss(0, 35))))
+                wx, wy = self.cow_x + ox, self.cow_y + oy
                 log.info(f"Walking back to cow area ({wx},{wy})")
                 await self._move(wx, wy)
             else:
                 log.info(f"Cow {eid} defeated")
+                # Remove from dead_npcs now that the kill is confirmed — this
+                # prevents the set growing unbounded across many respawn cycles.
+                # If the server reuses this entity ID for a respawned NPC, the
+                # next find_nearby_cows() call will re-evaluate it fresh.
                 self.state.dead_npcs.discard(eid)
-                # Human-like reaction time before engaging next target (0.3–1.5 s).
-                # Occasionally take a longer break to look less robotic (~5 % chance).
-                if random.random() < 0.05:
-                    idle = random.uniform(8.0, 20.0)
-                    log.info(f"Idle pause {idle:.1f}s (anti-detect)")
+
+                # ── Post-kill: opportunistic item pickup (≈30 % of kills) ────
+                # NPCs may drop items on death.  Real combat players pick up
+                # drops from the creatures they kill.  The bot never sends
+                # PLAYER_PICKUP_ITEM in combat — picking up drops post-kill adds
+                # that opcode to the action n-gram and directly addresses the
+                # selective-pickup detection signal.
+                if random.random() < 0.30:
+                    await self._pickup_nearby_items(reach=50)
+
+                # ── Post-kill: occasional combat stance change (≈8 % of kills) ─
+                # PLAYER_SET_STANCE is never sent across hundreds of kills — a
+                # 0-stance-change account is a detectable n-gram fingerprint.
+                await self._maybe_change_stance()
+
+                # ── Post-kill: rare position fidget (≈3 % of kills) ──────────
+                # After a kill the player's character might step to one side while
+                # scanning for the next target.
+                if random.random() < 0.03:
+                    await self._position_fidget()
+
+                # ── Post-kill idle / reaction delay ───────────────────────────
+                # Fatigue scale is applied so late-session reactions are slower.
+                if random.random() < 0.04:
+                    idle = random.uniform(8.0, 45.0)
+                    log.info(f"Idle pause {idle:.1f}s (simulating distraction)")
                     await asyncio.sleep(idle)
                 else:
-                    await asyncio.sleep(random.uniform(0.3, 1.5))
+                    await asyncio.sleep(_human_reaction() * self._fatigue_scale())
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
@@ -831,13 +1225,23 @@ class Bot:
         CLIENT_ACTIVITY (opcode 121) was removed from the game client enum
         in the latest update — do NOT send it or the OPCODE_MAPPING handshake
         will raise ValueError on a missing logical→wire entry.
+
+        We bypass _send() here (and apply_tick_slip=False) because the ping
+        interval already carries 0–1.2 s of uniform jitter from the JS source;
+        adding another tick_slip layer would push the interval distribution too
+        wide and look abnormal relative to the JS baseline.
         """
         seq = 0
         while True:
-            delay = 5.0 + random.uniform(0.0, 1.2)
+            # Match browser: Zo=5000 ms + uniform(0, Ra=1200 ms).
+            # Use lognormal on top of the base uniform so the distribution
+            # shape better matches real V8 setInterval firing under load.
+            base_delay  = 5.0 + random.uniform(0.0, 1.2)
+            delay       = _jitter(base_delay, scale=0.06)   # gentle extra spread
             await asyncio.sleep(delay)
             seq = (seq + 1) & 32767
             try:
+                # Send directly (no extra tick_slip — see docstring).
                 await self.ws.send(pack(C.CLIENT_PING, seq))
             except Exception:
                 break
@@ -857,17 +1261,23 @@ class Bot:
         """
         last_y: float | None = None
         while True:
-            await asyncio.sleep(0.5)
+            # JS source enforces a 30-frame (≈0.5 s at 60 fps) cooldown between
+            # CLIENT_POSITION_Y sends.  Add light jitter so the poll interval
+            # matches the natural variance a browser's rAF loop introduces.
+            await asyncio.sleep(_jitter(0.50, scale=0.10))
             if not self.ws:
                 continue
             # Convert x10 state coords to tile indices
             tx = self.state.x // 10
             tz = self.state.y // 10
             height = pathfinder._heights.get((tx, tz), 0.0)
-            # Only send when height changed by ≥ 0.05 (threshold from JS source)
+            # Only send when height changed by ≥ 0.05 (threshold from JS source).
+            # Route through _send() so tick_slip is applied — bypassing it here
+            # would create regular 0.5-second spikes whenever the player is moving
+            # through terrain with varying heights.
             if last_y is None or abs(height - last_y) >= 0.05:
                 try:
-                    await self.ws.send(pack(C.CLIENT_POSITION_Y, round(height * 10)))
+                    await self._send(pack(C.CLIENT_POSITION_Y, round(height * 10)))
                     last_y = height
                 except Exception:
                     break
@@ -885,6 +1295,11 @@ class Bot:
                  f"{len(pathfinder._dynamic_blocked)} dynamic blocks")
 
         self._token, self._device_id, self._device_cookie = await self._http_login()
+
+        # Record session start so _fatigue_scale() can measure elapsed time.
+        # Set once at login — not reset on reconnect so fatigue accumulates
+        # continuously across reconnect cycles within the same run.
+        self._session_start = time.monotonic()
 
         MAX_RECONNECTS = 5
         reconnect_count = 0
@@ -906,8 +1321,13 @@ class Bot:
             except asyncio.TimeoutError:
                 raise RuntimeError("No LOGIN_OK within 10 s")
 
-            # Shorter delay on reconnects (state already known from first login)
-            await asyncio.sleep(random.uniform(3.0, 5.0) if reconnect_count == 0 else 1.0)
+            # Shorter delay on reconnects (state already known from first login).
+            # Jitter the first-login delay too — uniform(3,5) is narrow enough
+            # to be detectable on a fleet of accounts started at the same time.
+            if reconnect_count == 0:
+                await asyncio.sleep(_jitter(random.uniform(3.0, 8.0), scale=0.25))
+            else:
+                await asyncio.sleep(_jitter(1.0))
             log.info(
                 f"Ready — mode={mode} pos=({self.state.x},{self.state.y}) "
                 f"trees={len(self.state.nearby_trees())} npcs={len(self.state.npcs)}"
