@@ -1591,6 +1591,25 @@ class Bot:
                 f"XP: {xp_s}"
             )
 
+    async def _uptime_loop(self):
+        """
+        Log total bot runtime once per minute — exact 60 s tick, no jitter.
+
+        Uses _session_start (set once at login, never reset on reconnect) so
+        the clock keeps running across reconnect cycles and reflects true wall
+        time since the bot started.  Format: '5m 00s' under an hour, then
+        '1h 05m 00s'.
+        """
+        while True:
+            await asyncio.sleep(60.0)
+            if not self._session_start:
+                continue
+            elapsed = time.monotonic() - self._session_start
+            h, rem  = divmod(int(elapsed), 3600)
+            m, s    = divmod(rem, 60)
+            runtime = f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+            log.info(f"UPTIME   {runtime}")
+
     async def _cursor_loop(self):
         """
         Periodically send CURSOR_POSITION to simulate idle human mouse movement.
@@ -1712,6 +1731,7 @@ class Bot:
             heartbeat = asyncio.create_task(self._heartbeat_loop())
             pos_y     = asyncio.create_task(self._position_y_loop())
             status    = asyncio.create_task(self._status_loop())
+            uptime    = asyncio.create_task(self._uptime_loop())
             cursor    = asyncio.create_task(self._cursor_loop())
 
             try:
@@ -1755,6 +1775,7 @@ class Bot:
                 heartbeat.cancel()
                 pos_y.cancel()
                 status.cancel()
+                uptime.cancel()
                 cursor.cancel()
 
             await ws.close()
