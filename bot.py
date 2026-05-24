@@ -86,32 +86,46 @@ def _tick_slip() -> float:
     """
     Multi-modal micro-jitter before every game packet send.
 
-    The old implementation used uniform U[10, 120ms].  A flat histogram is
-    itself a statistical fingerprint — the server's tickAlignedTiming detector
-    runs a modular-residue or KS test on inter-arrival times and flags uniform
-    distributions as readily as it flags zero-variance ones.
+    PURPOSE: break tick-phase alignment.  The server's tickAlignedTiming
+    detector computes (receive_time - tick_boundary) % tick_period for each
+    client packet and runs a KS test.  If most packets cluster near one
+    modular offset (because the bot always responds a fixed delay after the
+    previous server event) the distribution is flagged.
 
-    Real Chrome browser send timing (from DevTools Network traces):
-      - Baseline: rAF-driven lognormal, median ~25 ms, right-skewed.
-      - Minor GC / layout: 50–350 ms, ~15 % of sends.
-      - Major GC compaction: 350–1200 ms, ~3 % of sends.
+    WINDOWS TIMER NOTE: Without timeBeginPeriod(1), Python's asyncio.sleep()
+    is quantised to the 64 Hz OS timer interrupt (≈ 15.6 ms).  Every sample
+    in the range [2 ms, 15 ms] — roughly 30 % of baseline calls — rounds up
+    to exactly 15.6 ms, producing a comb distribution that a KS test detects
+    in fewer than 40 packets.  main() calls timeBeginPeriod(1) so all sleeps
+    have 1 ms resolution, matching Chrome's multimedia-timer profile.
 
-    Distribution stats:
-      P50 ≈  25 ms   P75 ≈  80 ms
-      P90 ≈ 210 ms   P99 ≈ 720 ms   mean ≈ 90 ms
+    Distribution targets (with 1 ms timer resolution):
+      - 74 % baseline:  lognormal, median e^-3.69 ≈ 25 ms, σ = 0.90.
+                        σ raised from 0.80 → 0.90 for fatter right tail
+                        and better modular coverage of 400–700 ms tick periods.
+      - 20 % GC minor:  uniform [20, 450] ms.  Range widened from [50,350]
+                        so the distribution covers >1 full typical tick period,
+                        guaranteeing near-uniform modular residue on its own.
+      -  6 % GC major:  uniform [450, 1200] ms (was 3 %).
+
+    Distribution stats (approximate):
+      P50 ≈  25 ms   P75 ≈  95 ms
+      P90 ≈ 280 ms   P99 ≈ 820 ms   mean ≈ 135 ms
     """
     r = random.random()
-    if r < 0.82:
-        # Baseline: lognormal, median e^-3.69 ≈ 25 ms, σ=0.80 (right-skewed).
-        # Capped at 200 ms — values beyond that fall into GC territory.
-        v = math.exp(random.gauss(-3.69, 0.80))
-        return max(0.002, min(v, 0.200))
-    elif r < 0.97:
-        # Minor GC / event-loop saturation: 50–350 ms uniform.
-        return random.uniform(0.050, 0.350)
+    if r < 0.74:
+        # Baseline: lognormal, median ~25 ms, σ=0.90 (right-skewed).
+        # Capped at 250 ms — values beyond that fall into GC territory.
+        v = math.exp(random.gauss(-3.69, 0.90))
+        return max(0.003, min(v, 0.250))
+    elif r < 0.94:
+        # Minor GC / event-loop saturation: 20–450 ms uniform.
+        # Widened range ensures >1 full tick period is covered, randomising
+        # the modular residue for typical 400–600 ms server tick rates.
+        return random.uniform(0.020, 0.450)
     else:
-        # Major GC compaction: 350–1200 ms (rare — ~3 % of sends).
-        return random.uniform(0.350, 1.200)
+        # Major GC compaction: 450–1200 ms (6 % of sends, up from 3 %).
+        return random.uniform(0.450, 1.200)
 
 
 def _load_dotenv() -> None:
@@ -715,8 +729,10 @@ class Bot:
             self._dispatch(data)
             if self.state._pending_map_ready:
                 self.state._pending_map_ready = False
-                await self.ws.send(pack(C.MAP_READY))
-                log.info("MAP_READY sent")
+                # Do NOT send MAP_READY inline — that would fire within the same
+                # asyncio tick as MAP_CHANGE, landing at the tick boundary itself.
+                # Spawn a task so _recv_loop continues reading while we wait.
+                asyncio.create_task(self._deferred_map_ready())
         # Signal all blocked waits so they raise ConnectionError immediately
         # instead of hanging until their own timeouts expire.
         self._ws_closed.set()
@@ -927,6 +943,32 @@ class Bot:
             self.state.x, self.state.y = cur_x, cur_y
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    async def _deferred_map_ready(self) -> None:
+        """
+        Send MAP_READY after a realistic scene-load delay.
+
+        MAP_CHANGE is a server tick-boundary event.  Sending MAP_READY in the
+        same asyncio tick (0 ms delay) is tick-aligned by definition and is
+        trivially detected.
+
+        A real client renders the terrain, populates the entity list, plays
+        the ambient audio, etc. before firing the ready callback.  Typical
+        observed delays in browser network traces: 0.4–2.5 s depending on
+        whether assets are cached.  We model this as lognormal around 1.1 s
+        with high variance (scale=0.45) so the delay is unpredictable and
+        the MAP_READY packet falls at a random offset within any tick period.
+        """
+        delay = _jitter(1.1, scale=0.45)
+        await asyncio.sleep(delay)
+        try:
+            # apply_tick_slip=False: the 1-2 s jitter already provides full-
+            # tick-period coverage; a second tick_slip layer would push the
+            # tail past 3 s and look abnormal for a local asset cache hit.
+            await self._send(pack(C.MAP_READY), apply_tick_slip=False)
+            log.info("MAP_READY sent")
+        except Exception:
+            pass
 
     async def _wait_for_event(self, event: asyncio.Event, timeout: float) -> bool:
         """
@@ -1159,16 +1201,25 @@ class Bot:
         a mis-click, a small camera adjustment, or just fidgeting.  This injects
         exactly that noise into the packet stream without disrupting navigation.
 
+        A brief pre-send glance delay (lognormal, median ~120 ms) is applied
+        before the nudge.  Without it, callers that reach _position_fidget()
+        without a preceding human-reaction sleep (e.g. post-kill paths where
+        neither pickup nor stance-change fired) would send PLAYER_MOVE within
+        a single asyncio tick of a server tick-boundary event — textbook
+        tick-aligned timing.
+
         Does NOT await arrival — the server processes the micro-step at its own
         pace and the bot continues with its next action regardless.
         """
+        # "Glance and decide" moment: lognormal, median ~120 ms, floor 60 ms.
+        await asyncio.sleep(max(0.060, _jitter(0.12, scale=0.50)))
         dirs = [(10, 0), (-10, 0), (0, 10), (0, -10)]
         dx, dy = random.choice(dirs)
         tx = self.state.x + dx
         ty = self.state.y + dy
         try:
             await self._send(pack(C.PLAYER_MOVE, 1, tx, ty))
-            log.debug(f"Position fidget: nudge → ({tx},{ty})")
+            log.debug(f"Position fidget: nudge to ({tx},{ty})")
         except Exception:
             pass
 
@@ -1467,7 +1518,7 @@ class Bot:
             # Use lognormal on top of the base uniform so the distribution
             # shape better matches real V8 setInterval firing under load.
             base_delay  = 5.0 + random.uniform(0.0, 1.2)
-            delay       = _jitter(base_delay, scale=0.06)   # gentle extra spread
+            delay       = _jitter(base_delay, scale=0.10)   # widened from 0.06
             await asyncio.sleep(delay)
             seq = (seq + 1) & 32767
             try:
@@ -1761,6 +1812,26 @@ def main():
         asyncio.run(bot.sniff())
         return
 
+    # ── Windows high-resolution timer ────────────────────────────────────────
+    # Python's asyncio.sleep() on Windows defaults to the 64 Hz OS timer
+    # interrupt (≈ 15.6 ms granularity).  Every _tick_slip() sample smaller
+    # than 15.6 ms — ~30 % of baseline lognormal draws — rounds up to exactly
+    # 15.6 ms, turning a smooth lognormal into a comb distribution that a KS
+    # test detects in under 40 packets.
+    #
+    # timeBeginPeriod(1) raises the Windows multimedia timer to 1 kHz,
+    # giving 1 ms resolution for all asyncio.sleep() calls.  This is exactly
+    # what Chrome, Firefox, and most game clients do on Windows.
+    _win_timer_set = False
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)
+            _win_timer_set = True
+            log.info("Timer resolution: 1 ms (Windows high-resolution mode active)")
+        except Exception as _e:
+            log.warning(f"Could not set Windows timer resolution: {_e}")
+
     mode = args.mode or _select_mode_interactive()
     log.info(f"Starting in {mode} mode")
     try:
@@ -1769,6 +1840,12 @@ def main():
         log.info("Interrupted by user")
     finally:
         bot._print_session_summary()
+        if _win_timer_set:
+            try:
+                import ctypes
+                ctypes.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
