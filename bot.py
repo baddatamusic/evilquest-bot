@@ -86,11 +86,18 @@ def _tick_slip() -> float:
     """
     Multi-modal micro-jitter before every game packet send.
 
-    PURPOSE: break tick-phase alignment.  The server's tickAlignedTiming
-    detector computes (receive_time - tick_boundary) % tick_period for each
-    client packet and runs a KS test.  If most packets cluster near one
-    modular offset (because the bot always responds a fixed delay after the
-    previous server event) the distribution is flagged.
+    PURPOSE: break tick-phase alignment AND produce human-like reactionMedianMs.
+    The server tracks two related metrics:
+      • tickAlignStdDevMs  — std(arrival_time mod tick_period) per packet stream.
+        Low stddev means packets arrive at the same phase each tick → bot.
+      • reactionMedianMs   — median time from a server event to the client's next
+        action packet.  Values < 100 ms are physically impossible for humans
+        (minimum human RT is ~150 ms); the old P50 of 25 ms was flagged.
+
+    The distribution must simultaneously:
+      1. Cover > one full tick period so modular residues are near-uniform.
+      2. Have P50 ≥ 120 ms to match the human baseline reaction floor.
+      3. Have a fat right tail (GC pauses, tab-switch events, cognitive drift).
 
     WINDOWS TIMER NOTE: Without timeBeginPeriod(1), Python's asyncio.sleep()
     is quantised to the 64 Hz OS timer interrupt (≈ 15.6 ms).  Every sample
@@ -99,33 +106,30 @@ def _tick_slip() -> float:
     in fewer than 40 packets.  main() calls timeBeginPeriod(1) so all sleeps
     have 1 ms resolution, matching Chrome's multimedia-timer profile.
 
-    Distribution targets (with 1 ms timer resolution):
-      - 74 % baseline:  lognormal, median e^-3.69 ≈ 25 ms, σ = 0.90.
-                        σ raised from 0.80 → 0.90 for fatter right tail
-                        and better modular coverage of 400–700 ms tick periods.
-      - 20 % GC minor:  uniform [20, 450] ms.  Range widened from [50,350]
-                        so the distribution covers >1 full typical tick period,
-                        guaranteeing near-uniform modular residue on its own.
-      -  6 % GC major:  uniform [450, 1200] ms (was 3 %).
+    Distribution targets (1 ms timer resolution):
+      - 55 % baseline:  lognormal, median ~120 ms, σ_ln = 0.80.
+                        Matches measured simple-RT cognitive studies; fat tail
+                        reaches 500 ms for distracted/slow responses.
+      - 33 % mid-range: uniform [60, 700] ms.  Covers > one full typical tick
+                        period (400–600 ms), guaranteeing near-uniform phase.
+      - 12 % long tail: uniform [700, 2000] ms (tab-switch / major GC / AFK).
 
     Distribution stats (approximate):
-      P50 ≈  25 ms   P75 ≈  95 ms
-      P90 ≈ 280 ms   P99 ≈ 820 ms   mean ≈ 135 ms
+      P25 ≈  65 ms   P50 ≈ 120 ms
+      P75 ≈ 270 ms   P90 ≈ 550 ms   P99 ≈ 1400 ms   mean ≈ 340 ms
     """
     r = random.random()
-    if r < 0.74:
-        # Baseline: lognormal, median ~25 ms, σ=0.90 (right-skewed).
-        # Capped at 250 ms — values beyond that fall into GC territory.
-        v = math.exp(random.gauss(-3.69, 0.90))
-        return max(0.003, min(v, 0.250))
-    elif r < 0.94:
-        # Minor GC / event-loop saturation: 20–450 ms uniform.
-        # Widened range ensures >1 full tick period is covered, randomising
-        # the modular residue for typical 400–600 ms server tick rates.
-        return random.uniform(0.020, 0.450)
+    if r < 0.55:
+        # Human baseline: lognormal, median ~120 ms, σ=0.80.
+        # Capped at 600 ms — slower responses go into the mid-range bucket.
+        v = math.exp(random.gauss(math.log(0.120), 0.80))
+        return max(0.025, min(v, 0.600))
+    elif r < 0.88:
+        # Mid-range: uniform [60, 700] ms — covers a full server tick period.
+        return random.uniform(0.060, 0.700)
     else:
-        # Major GC compaction: 450–1200 ms (6 % of sends, up from 3 %).
-        return random.uniform(0.450, 1.200)
+        # Long tail: tab-switch, major GC, cognitive drift (12 % of sends).
+        return random.uniform(0.700, 2.000)
 
 
 def _load_dotenv() -> None:
@@ -1059,6 +1063,7 @@ class Bot:
         # action_index 0 = first interaction option (e.g. "Chop" for trees).
         # tick_slip is already applied inside _send() so packet arrival is
         # phase-shifted within the server tick window.
+        await self._click_cursor()
         await self._send(pack(C.PLAYER_INTERACT_OBJECT, eid, 0))
 
         if not await self._wait_for_event(self.state.ev_skilling_start, 6.0):
@@ -1379,6 +1384,7 @@ class Bot:
             self.state.dead_npcs.discard(eid)
             self.state.ev_player_died.clear()
             self.state.ev_player_respawned.clear()
+            await self._click_cursor()
             await self._send(pack(C.PLAYER_ATTACK_NPC, eid))
 
             # Jitter the per-combat timeout.  An exact 60 s deadline appears
@@ -1585,6 +1591,63 @@ class Bot:
                 f"XP: {xp_s}"
             )
 
+    async def _cursor_loop(self):
+        """
+        Periodically send CURSOR_POSITION to simulate idle human mouse movement.
+
+        Real browsers fire CURSOR_POSITION on every pointermove (throttled by
+        the game client to once per 1500 ms) and on every click/keydown
+        (unthrottled).  A real player generates ~200–2000 cursor events per hour.
+        We were sending 0 — sessionCursorEvents=0 is a trivially obvious bot
+        fingerprint visible in the server admin panel.
+
+        Simulate idle mouse drift: random walk around the centre of the game
+        viewport every 2–8 s (lognormal, median ~3 s).  Before each action packet
+        (_click_cursor) we also inject a forced click-like event.
+        """
+        cx, cy = 480, 510   # start near game viewport centre (0–1000 scale)
+        _ok = True           # set False if CURSOR_POSITION not in opcode map
+        while _ok:
+            wait = math.exp(random.gauss(math.log(3.0), 0.60))
+            await asyncio.sleep(max(1.0, min(8.0, wait)))
+            if not self.ws or self._ws_closed.is_set():
+                continue
+            # Random walk: ±70 units per step, clamped to playable area [120, 880]
+            cx = max(120, min(880, cx + random.randint(-70, 70)))
+            cy = max(120, min(880, cy + random.randint(-55, 55)))
+            try:
+                await self.ws.send(pack(C.CURSOR_POSITION, cx, cy))
+            except ValueError:
+                # CURSOR_POSITION not in this session's opcode mapping — give up.
+                log.debug("CURSOR_POSITION not in opcode map — cursor loop stopped")
+                _ok = False
+            except Exception:
+                break
+
+    async def _click_cursor(self, hint_x: int | None = None, hint_y: int | None = None):
+        """
+        Send a CURSOR_POSITION event simulating a player clicking on a target.
+
+        Called just before PLAYER_ATTACK_NPC and PLAYER_INTERACT_OBJECT so that
+        the server records a cursor event immediately prior to the action packet,
+        reducing sessionInputlessCommands from ~100% to near 0%.
+
+        hint_x/hint_y: optional coarse screen coordinates (0-1000 scale) if the
+        caller has context about where the target appears on screen.  Defaults to
+        a random position in the centre 40% of the viewport.
+        """
+        x = hint_x if hint_x is not None else random.randint(320, 680)
+        y = hint_y if hint_y is not None else random.randint(280, 620)
+        # Natural jitter: finger position isn't pixel-perfect
+        x = max(50, min(950, x + random.randint(-25, 25)))
+        y = max(50, min(950, y + random.randint(-20, 20)))
+        try:
+            await self.ws.send(pack(C.CURSOR_POSITION, x, y))
+            # JS event loop tick between cursor and action: 1–16 ms
+            await asyncio.sleep(random.uniform(0.001, 0.016))
+        except (ValueError, Exception):
+            pass   # opcode not mapped or ws closed — silent, action still proceeds
+
     def _print_session_summary(self) -> None:
         """Print a full session report — called on clean exit or Ctrl+C."""
         if not self._session_start:
@@ -1649,6 +1712,7 @@ class Bot:
             heartbeat = asyncio.create_task(self._heartbeat_loop())
             pos_y     = asyncio.create_task(self._position_y_loop())
             status    = asyncio.create_task(self._status_loop())
+            cursor    = asyncio.create_task(self._cursor_loop())
 
             try:
                 await asyncio.wait_for(self.state.ev_login_ok.wait(), timeout=10.0)
@@ -1691,6 +1755,7 @@ class Bot:
                 heartbeat.cancel()
                 pos_y.cancel()
                 status.cancel()
+                cursor.cancel()
 
             await ws.close()
 

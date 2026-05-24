@@ -69,7 +69,7 @@ import requests
 
 ENC_BYTE_0 = 0xFE   # J = 254  — encrypted frame marker first byte
 ENC_BYTE_1 = 0x02   # H = 2    — protocol version byte
-PROTOCOL_VERSION = 12            # ms = 12 in GameManager JS (updated May 2026)
+PROTOCOL_VERSION = 13            # bi = 13 in GameManager-_UxitI8j.js (updated May 2026)
 CRYPTO_VERSION   = 2             # qe = 2
 OPCODE_MAPPING_VERSION = 1       # bt = 1
 
@@ -90,7 +90,9 @@ _last_cdp_port: int = int(os.environ.get("EQ_CDP_PORT", 0) or 0)
 #   121      — CLIENT_ACTIVITY  (removed from client enum entirely)
 _CLIENT_LOGICAL = sorted({
     10, 20, 21, 22, 23, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 44, 45,
-    50, 60, 70, 71, 80, 81, 82, 83, 90, 91, 92, 93, 94, 95, 120,
+    50, 60, 70, 71, 80, 81, 82, 83, 90, 91, 92, 93, 94, 95, 120, 122,
+    #                                                               ^^^
+    # 122 = CURSOR_POSITION (mouse x/y scaled to [0,1000]); added May 2026
 })
 
 # Server-side logical opcodes that ARE in the opcode mapping
@@ -968,13 +970,37 @@ async def async_http_login(username: str, password: str) -> tuple[str, str, str]
                     else:
                         _log.warning("cached-auth: device-key non-ok: %s", _qrd)
                 except Exception as _qe:
-                    _log.warning("cached-auth: device-key registration failed: %s", _qe)
+                    # 401 = token expired server-side — discard cache and force
+                    # a fresh browser login so we get a new token + cookies.
+                    _is_401 = (
+                        hasattr(_qe, "response")
+                        and _qe.response is not None
+                        and getattr(_qe.response, "status_code", 0) == 401
+                    )
+                    if _is_401:
+                        _log.info(
+                            "cached-auth: token rejected by server (401) "
+                            "— discarding cache, need fresh browser login"
+                        )
+                        try:
+                            _state_path("auth.json").unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        # Fall through to browser login (skip `return cached`)
+                    else:
+                        _log.warning("cached-auth: device-key registration failed: %s", _qe)
+                        return cached
             else:
                 _log.warning(
                     "cached-auth: no Python signing key found — "
                     "WS handshake will likely fail; run with Chrome to fix"
                 )
-            return cached
+                return cached
+            # Only reach here when device-key succeeded (or key was not None
+            # and registration failed with a non-401 error — already returned).
+            # If we got a 401 we fall through to the browser login block below.
+            if _state_path("auth.json").exists():
+                return cached
 
     try:
         from pydoll.browser.chromium import Chrome
@@ -1697,10 +1723,13 @@ class GameWebSocket:
         # produces a sub-millisecond challenge→response gap that is trivially
         # distinguishable from a real browser.
         #
-        # Lognormal distribution: median ≈ 22 ms, σ_ln = 0.55.
-        # Clamped to [8, 80] ms to match real-world P-256 timing range.
-        _subtle_delay = math.exp(random.gauss(math.log(0.022), 0.55))
-        await asyncio.sleep(max(0.008, min(0.080, _subtle_delay)))
+        # Real browser SubtleCrypto.importKey + deriveKey on P-256 takes 15-300 ms
+        # depending on hardware, browser version, and GC pressure.  The true
+        # distribution is heavy-tailed lognormal: median ~45 ms, σ_ln = 0.70.
+        # The previous [8, 80] ms clamp was too narrow and too fast, making the
+        # timing distribution trivially distinguishable from browsers.
+        _subtle_delay = math.exp(random.gauss(math.log(0.045), 0.70))
+        await asyncio.sleep(max(0.015, min(0.300, _subtle_delay)))
 
         # Send CRYPTO_RESPONSE (plain, not encrypted, client opcode 2)
         response_json = json.dumps({
@@ -1730,6 +1759,14 @@ class GameWebSocket:
         mapping_json = self._parse_str_frame(mapping_plain)
         self._mapping = OpcodeMapping.from_json(json.loads(mapping_json))
 
+        # A real browser spends several JS event-loop ticks parsing the opcode
+        # mapping JSON, scheduling micro-tasks, and updating internal state before
+        # it returns from the async handshake function.  Returning immediately
+        # (< 1 ms after decryption) is a machine-speed fingerprint.
+        # Lognormal: median ~12 ms, σ_ln = 0.55, clamped to [4, 60] ms.
+        _mapping_settle = math.exp(random.gauss(math.log(0.012), 0.55))
+        await asyncio.sleep(max(0.004, min(0.060, _mapping_settle)))
+
     @staticmethod
     def _parse_str_frame(data: bytes) -> str:
         """Parse a string frame: [opcode][str_len uint16][str UTF-8]."""
@@ -1755,8 +1792,13 @@ class GameWebSocket:
             # on the browser's event-loop backlog and OS scheduler.  Responding
             # in the same asyncio tick as the read (zero delay) is a machine-speed
             # fingerprint — no human-operated browser ever achieves it.
-            # Uniform(1, 15 ms) matches the observed browser pong latency range.
-            await asyncio.sleep(random.uniform(0.001, 0.015))
+            # A browser pong delay is NOT uniform — it follows a lognormal
+            # distribution driven by event-loop scheduling jitter.  Uniform
+            # distributions are a statistical fingerprint (server detects them
+            # via KS test over accumulated pong samples).  Use lognormal:
+            # median ~5 ms, σ_ln = 0.60, clamped to [1, 50] ms.
+            _pong_delay = math.exp(random.gauss(math.log(0.005), 0.60))
+            await asyncio.sleep(max(0.001, min(0.050, _pong_delay)))
             await self._send_raw_ws(payload, opcode=10)
             return None
         if opcode == 8:

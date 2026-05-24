@@ -53,7 +53,8 @@ class C:
     TRADE_ACCEPT         = 95
     # DUEL opcodes 100-105 removed from game (duel system entirely removed)
     CLIENT_PING          = 120
-    # CLIENT_ACTIVITY = 121  — removed from game client enum; do NOT send
+    # CLIENT_ACTIVITY = 121  — removed from opcode map; do NOT send (ValueError)
+    CURSOR_POSITION      = 122   # mouse cursor x,y scaled to [0,1000]
 
 
 # ── Server → Client opcodes ───────────────────────────────────────────────────
