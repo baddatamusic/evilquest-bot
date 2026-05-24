@@ -669,17 +669,7 @@ class Bot:
             log.debug(f"PLAYER_STATS vals={vals}")
 
         elif op == S.PLAYER_REMOTE_EQUIPMENT:
-            # Another player's equipped items: vals=[entity_id, item_id×9_slots]
-            if len(vals) >= 1:
-                eid   = vals[0]
-                slots = vals[1:]
-                parts = []
-                for i, iid in enumerate(slots):
-                    if iid and i < len(EQUIP_SLOTS):
-                        name = ITEM_NAMES.get(iid, f"item_{iid}")
-                        parts.append(f"{EQUIP_SLOTS[i]}={name}")
-                gear = ", ".join(parts) if parts else "none"
-                log.info(f"GEAR     entity={eid:<4}  {gear}")
+            pass  # other players' gear — handled silently
 
         elif op == S.NPC_EQUIPMENT:
             # NPC equipped items — usually all zeros. Silently discard unless equipped.
