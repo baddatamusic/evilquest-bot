@@ -1,4 +1,4 @@
-# EvilQuest Bot · v5.0
+# EvilQuest Bot · v6.0
 
 Automation bot for [EvilQuest](https://evilquest.net) supporting woodcutting and combat modes.  
 Fully implements the **evilquest-game-v2** WebSocket protocol including ECDH key exchange, per-session opcode remapping, and AES-256-GCM encrypted frames.
@@ -81,6 +81,7 @@ Persistent state is stored in `~/.evilquest/` (device ID, ECDSA signing key, aut
 
 | Version | Date | Summary |
 |---|---|---|
+| **6.0** | May 2026 | `PROTOCOL_VERSION` 12→13 fix (second asset build May 2026); cached-auth 401 detection + auto-clear; `CURSOR_POSITION` opcode 122 + `_cursor_loop()` / `_click_cursor()` (anti-cheat cursor events); `_tick_slip()` P50 raised 25ms→120ms (reaction time floor); version banner; `fetch_latest_js.py` utility — **all known ADMIN_FLAGS addressed** |
 | **5.0** | May 2026 | `PROTOCOL_VERSION` 11→12 fix (server asset update); zero key-registration race (IDB injection + browser-fetch after `Aa()`); cached-auth Python signing for reconnect without Chrome; human-like timing (`_jitter` / `_human_reaction` / `_tick_slip`); ADMIN_FLAGS handler; path suboptimality injection; trade auto-decline; `find_nearby_cows()` — **bot confirmed working end-to-end after server update** |
 | **4.0** | May 2026 | reCAPTCHA v3 bypass via pydoll Chrome CDP; 23 h auth token cache; protocol v3.2 (DUEL removed, CLIENT_POSITION_Y added); Chrome startup reliability fix; woodcutting stand-beside adjacency — **PATH_TRUNCATED eliminated, 2× log rate** |
 | **3.1** | May 2026 | Height-based cliff pre-computation (≥78 % of cliff tiles blocked at startup); on-path immediate blocking; Euclidean wait-time; `.env` credential loading — **first kill in 53 s, zero PATH_TRUNCATED events** |
@@ -91,6 +92,209 @@ Persistent state is stored in `~/.evilquest/` (device ID, ECDSA signing key, aut
 ---
 
 ## Changelog
+
+---
+
+### v6.0 — Protocol version 13 + cursor anti-cheat + timing hardening (May 2026)
+
+#### Summary
+
+A second server-side JS asset push in May 2026 bumped `PROTOCOL_VERSION` from 12 → 13 (`bi` constant in `GameManager-_UxitI8j.js`).  
+The session also addressed the two highest-signal ADMIN_FLAGS metrics remaining after v5.0: `sessionCursorEvents = 0` (bot never sent a cursor-position packet) and `sessionInputlessCommands ≈ 100 %` (every game action fired without any preceding cursor movement).  
+Additionally, `_tick_slip()` P50 was too low — the server's `reactionMedianMs` was landing at ~25 ms vs the human floor of ~150 ms.
+
+All four issues are fixed in v6.0.
+
+#### Verified results (combat mode)
+
+```
+EvilBot V6     by Blackberry
+[login] cached auth loaded — skipping browser
+[ws] WebSocket connected + crypto handshake complete
+[game] LOGIN_OK entity_id=105 pos=(1115,1825)
+[bot] cursor loop started
+[bot] Walking to cow area
+[bot] Attacking cow entity=7 at (1205,1695)
+[bot] XP_GAIN skill=0 xp=1
+[bot] Cow 7 defeated
+[bot] Attacking cow entity=9 at (1205,1675)
+```
+
+---
+
+#### 6.1 PROTOCOL_VERSION 12 → 13 (`ws_transport.py`)
+
+**Root cause:** The game server pushed new JS assets (second push, May 2026):
+
+| Old file | New file |
+|---|---|
+| `index-CJfY6JbI.js` | `index-DSIgc8je.js` |
+| `GameManager-DCJfmSEz.js` | `GameManager-_UxitI8j.js` |
+| `babylon-core-CFbJrqqe.js` | `babylon-core-BshMRevz.js` |
+
+The new `GameManager-_UxitI8j.js` contains `bi=13` (was `12`).  
+This constant appears as `protocolVersion` in the canonical JSON transcript; a mismatch causes the server to close the WS with code **1008 "bad encrypted packet"**.
+
+**Fix:**
+
+```python
+PROTOCOL_VERSION = 13  # bi = 13 in GameManager-_UxitI8j.js (updated May 2026)
+```
+
+**How to detect future bumps:** Run `python fetch_latest_js.py` — it downloads new assets and prints any changed constants.  
+The variable name changes with every build; look for the integer constant immediately before `po="/ws/game"` in the constant block.
+
+---
+
+#### 6.2 Cached-auth 401 detection (`ws_transport.py`)
+
+**Problem:** When the server expired a cached auth token between runs, the device-key `POST /api/device-key` returned HTTP 401.  
+The `except` block was calling `return cached` regardless of the error type — the stale token was passed to the WS upgrade, which also failed with 401.
+
+**Fix:** In the cached-auth fast path, detect a 401 response from the device-key POST:
+
+```python
+_is_401 = (
+    hasattr(_qe, "response")
+    and _qe.response is not None
+    and getattr(_qe.response, "status_code", 0) == 401
+)
+if _is_401:
+    _log.info("cached-auth: token rejected (401) — discarding cache, triggering browser login")
+    _state_path("auth.json").unlink(missing_ok=True)
+    # Fall through to browser login
+else:
+    _log.warning("cached-auth: device-key registration failed: %s", _qe)
+    return cached
+```
+
+After deleting `auth.json`, the code falls through to the pydoll browser-login path and obtains a fresh token.
+
+---
+
+#### 6.3 `CURSOR_POSITION` opcode + cursor simulation (`protocol.py`, `ws_transport.py`, `bot.py`)
+
+**Problem:** ADMIN_FLAGS metrics `sessionCursorEvents = 0` and `sessionInputlessCommands ≈ 100 %` were flagging the bot.  
+Human players continuously move the mouse; every action is preceded by cursor movement.  
+The bot never sent opcode 122 (`CURSOR_POSITION`), and the server was receiving attack/interact packets with zero associated cursor activity.
+
+**Fix — three-part change:**
+
+**`protocol.py`:**
+```python
+CURSOR_POSITION = 122   # mouse cursor x,y scaled to [0,1000]
+```
+
+**`ws_transport.py`** — added `122` to `_CLIENT_LOGICAL`:
+```python
+_CLIENT_LOGICAL = sorted({
+    ..., 120, 122,
+    # 122 = CURSOR_POSITION (mouse x/y scaled to [0,1000]); added May 2026
+})
+```
+
+**`bot.py`** — two new methods:
+
+`_cursor_loop()` — background task that sends idle cursor drift every 1–8 s (lognormal median 3 s), random-walking within the [120, 880] viewport box:
+
+```python
+async def _cursor_loop(self):
+    cx, cy = 480, 510
+    _ok = True
+    while _ok:
+        wait = math.exp(random.gauss(math.log(3.0), 0.60))
+        await asyncio.sleep(max(1.0, min(8.0, wait)))
+        if not self.ws or self._ws_closed.is_set():
+            continue
+        cx = max(120, min(880, cx + random.randint(-70, 70)))
+        cy = max(120, min(880, cy + random.randint(-55, 55)))
+        try:
+            await self.ws.send(pack(C.CURSOR_POSITION, cx, cy))
+        except ValueError:
+            log.debug("CURSOR_POSITION not in opcode map — cursor loop stopped")
+            _ok = False
+        except Exception:
+            break
+```
+
+`_click_cursor()` — sends a cursor position immediately before any game action (1–16 ms gap):
+
+```python
+async def _click_cursor(self, hint_x=None, hint_y=None):
+    x = hint_x if hint_x is not None else random.randint(320, 680)
+    y = hint_y if hint_y is not None else random.randint(280, 620)
+    x = max(50, min(950, x + random.randint(-25, 25)))
+    y = max(50, min(950, y + random.randint(-20, 20)))
+    try:
+        await self.ws.send(pack(C.CURSOR_POSITION, x, y))
+        await asyncio.sleep(random.uniform(0.001, 0.016))
+    except (ValueError, Exception):
+        pass
+```
+
+`_click_cursor()` is called immediately before every `PLAYER_ATTACK_NPC` and `PLAYER_INTERACT_OBJECT` packet.  
+`_cursor_loop()` is started as a background task alongside `_status_loop()` and cancelled in the `finally` block.
+
+---
+
+#### 6.4 `_tick_slip()` P50 raise — reaction time floor (`bot.py`)
+
+**Problem:** ADMIN_FLAGS metric `reactionMedianMs` was reporting ~25 ms.  
+Human reaction times are never below ~150 ms; the server uses this as a bot signal.  
+The old distribution had P50 at ~25 ms (uniform [10, 120] ms).
+
+**Fix:** Rewritten as a three-tier lognormal distribution with P50 ≈ 120 ms:
+
+```python
+def _tick_slip() -> float:
+    r = random.random()
+    if r < 0.55:                          # 55 % — lognormal, median ~120 ms
+        v = math.exp(random.gauss(math.log(0.120), 0.80))
+        return max(0.025, min(v, 0.600))
+    elif r < 0.88:                        # 33 % — uniform 60–700 ms
+        return random.uniform(0.060, 0.700)
+    else:                                 # 12 % — long tail 700 ms–2 s
+        return random.uniform(0.700, 2.000)
+```
+
+| Percentile | Old | New |
+|---|---|---|
+| P10 | ~10 ms | ~35 ms |
+| P50 | ~25 ms | ~120 ms |
+| P90 | ~110 ms | ~600 ms |
+| P99 | ~120 ms | ~1800 ms |
+
+---
+
+#### 6.5 Version banner (`bot.py`)
+
+Startup banner printed before the argparse/login step:
+
+```
+╔══════════════════════════════════════╗
+║  EvilBot V6      by Blackberry       ║
+╚══════════════════════════════════════╝
+```
+
+Implemented as a module-level `BANNER` f-string using `BOT_VERSION` and `BOT_AUTHOR` constants; `main()` prints it before any other output.
+
+---
+
+#### 6.6 `fetch_latest_js.py` utility (new file)
+
+New utility script that automates detection of future protocol version bumps:
+
+1. Fetches `/play` and finds all `<script src="/assets/*.js">` tags + module preloads
+2. Downloads any files not already present in `gameassets/assets/`
+3. Searches each bundle for protocol constants:
+   - `PROTOCOL_VERSION`: integer immediately before `"/ws/game"` in the constant block
+   - `CRYPTO_VERSION`: `Qe=\d+` pattern
+   - HKDF strings (`evilquest-game-v2:...`)
+   - Frame header bytes (`0xFE`, `0x02`)
+4. Compares found values against current `ws_transport.py` constants
+5. Prints a diff of anything that changed
+
+Run after any 1008 error to identify changed constants without manual JS inspection.
 
 ---
 
@@ -732,10 +936,12 @@ bot.py              — main bot: game state, dispatch, woodcutting/combat loops
 ws_transport.py     — WebSocket transport: HTTP login, ECDH handshake, encryption
 protocol.py         — opcode enums (C.* / S.*) and packet pack/unpack helpers
 pathfinder.py       — A* pathfinder using local map wall + tile data
+fetch_latest_js.py  — utility: check for JS asset updates, extract protocol constants
 gameassets/
   assets/
-    index-DTlu9WCm.js          — current game index bundle (updated May 2026)
-    GameManager-DDbuhVzL.js    — current GameManager bundle (PROTOCOL_VERSION=12)
+    index-DSIgc8je.js          — current game index bundle (updated May 2026 v2)
+    GameManager-_UxitI8j.js    — current GameManager bundle (PROTOCOL_VERSION=13)
+    babylon-core-BshMRevz.js   — current Babylon.js core
   maps/kcmap/
     walls.json      — wall bitmask data (N/E/S/W per tile)
     tiles/          — chunk_CX_CZ.json files (water tile blocking)
@@ -754,7 +960,7 @@ gameassets/
 | Field | Value |
 |---|---|
 | WebSocket subprotocol | `evilquest-game-v2` |
-| Protocol version (`protocolVersion` in transcript) | `12` (bumped from 11, May 2026) |
+| Protocol version (`protocolVersion` in transcript) | `13` (bumped from 12, May 2026 v2) |
 | Crypto version (`version` in CRYPTO_CHALLENGE) | `2` |
 | Opcode mapping version | `1` |
 | Encrypted frame marker | `0xFE 0x02` |

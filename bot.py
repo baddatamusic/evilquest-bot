@@ -1827,7 +1827,7 @@ def _select_mode_interactive() -> str:
         print("  Enter 1 or 2.")
 
 
-BOT_VERSION = "V5"
+BOT_VERSION = "V6"
 BOT_AUTHOR  = "Blackberry"
 
 BANNER = f"""
