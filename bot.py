@@ -206,6 +206,32 @@ ITEM_NAMES:  dict[int, str]  = _load_item_names()
 OBJECT_DATA: dict[int, dict] = _load_object_data()
 
 
+def _load_npc_names() -> dict[int, str]:
+    p = Path("gameassets/data/npcs.json")
+    if not p.exists():
+        return {}
+    try:
+        rows = json.loads(p.read_text(encoding="utf-8"))
+        rows = rows if isinstance(rows, list) else list(rows.values())
+        return {r["id"]: r.get("name", f"npc_{r['id']}") for r in rows if "id" in r}
+    except Exception:
+        return {}
+
+
+NPC_NAMES: dict[int, str] = _load_npc_names()
+
+# Op codes that fell through to the unhandled branch — printed in session summary.
+_unhandled_counts: dict[int, int] = {}
+
+
+def _hp_bar(hp: int, max_hp: int, width: int = 10) -> str:
+    """ASCII health bar: '[######....] 24/31'."""
+    if max_hp <= 0:
+        return f"[{'?' * width}] {hp}/??"
+    filled = max(0, min(width, round(width * hp / max_hp)))
+    return f"[{'#' * filled}{'.' * (width - filled)}] {hp}/{max_hp}"
+
+
 def _describe_object(eid: int | None, objects: dict) -> str:
     """Return a human-readable label for a world object entity."""
     if eid is None:
@@ -248,6 +274,8 @@ class State:
 
         self.equipped: dict[str, int] = {}
 
+        self.max_hp: int = 0
+        self._kills:        int = 0               # combat kills this session
         self._xp_session:   dict[int, int] = {}   # skill_id → XP gained this session
         self._skill_levels: dict[int, int] = {}   # skill_id → current level
 
@@ -393,6 +421,8 @@ class Bot:
                 self.state.x, self.state.y = vals[0], vals[1]
             if len(vals) >= 3:
                 self.state.hp = vals[2]
+            if len(vals) >= 4 and vals[3] > 0:
+                self.state.max_hp = vals[3]
 
             if not self.state._has_hp_baseline:
                 if self.state.hp > 0:
@@ -446,6 +476,8 @@ class Bot:
                 eid, iid, qty, gx, gy = vals[:5]
                 if qty > 0:
                     self.state.ground_items[eid] = (iid, qty, gx, gy)
+                    name = ITEM_NAMES.get(iid, f"item_{iid}")
+                    log.debug(f"GROUND   {name} ×{qty} at ({gx},{gy})")
                 else:
                     self.state.ground_items.pop(eid, None)
 
@@ -464,16 +496,24 @@ class Bot:
 
         elif op == S.COMBAT_HIT:
             if len(vals) >= 3:
-                log.debug(f"COMBAT_HIT attacker={vals[0]} target={vals[1]} dmg={vals[2]}")
+                attacker, target, dmg = vals[0], vals[1], vals[2]
+                if target == self.state.own_entity_id:
+                    bar = _hp_bar(self.state.hp, self.state.max_hp)
+                    log.info(f"HIT      -{dmg:<3}  HP {bar}")
+                else:
+                    npc  = self.state.npcs.get(target)
+                    tid  = npc[0] if npc else None
+                    name = NPC_NAMES.get(tid, f"entity_{target}") if tid is not None else f"entity_{target}"
+                    log.debug(f"HIT      +{dmg} → {name}")
 
         elif op == S.SKILLING_START:
             obj_desc = _describe_object(vals[0] if vals else None, self.state.objects)
-            log.info(f"SKILLING  ▶  {obj_desc}")
+            log.info(f"SKILLING  >>  {obj_desc}")
             self.state.ev_skilling_start.set()
 
         elif op == S.SKILLING_STOP:
             obj_desc = _describe_object(vals[0] if vals else None, self.state.objects)
-            log.info(f"SKILLING  ■  {obj_desc}")
+            log.info(f"SKILLING  --  {obj_desc}")
             self.state.logs_chopped      += 1
             self.state.logs_in_inventory += 1   # logs go directly to inventory
             self.state.ev_skilling_stop.set()
@@ -592,11 +632,11 @@ class Bot:
                 sid, new_lvl = vals[0], vals[1]
                 skill = SKILL_NAMES.get(sid, f"skill_{sid}")
                 self.state._skill_levels[sid] = new_lvl
-                log.info(f"★ LEVEL UP  {skill} → {new_lvl} ★")
+                log.info(f"** LEVEL UP  {skill} -> {new_lvl} **")
             elif len(vals) == 1:
                 sid   = vals[0]
                 skill = SKILL_NAMES.get(sid, f"skill_{sid}")
-                log.info(f"★ LEVEL UP  {skill} ★")
+                log.info(f"** LEVEL UP  {skill} **")
             else:
                 log.info(f"LEVEL_UP vals={vals}")
 
@@ -651,6 +691,7 @@ class Bot:
         else:
             parsed = try_unpack_str(raw)
             label  = SERVER_NAMES.get(op, f"op_{op}")
+            _unhandled_counts[op] = _unhandled_counts.get(op, 0) + 1
             if parsed:
                 log.debug(f"{label}: str={parsed[0]!r} vals={parsed[1]}")
             else:
@@ -1285,7 +1326,11 @@ class Bot:
                 await asyncio.sleep(_jitter(0.50))
                 continue
 
-            log.info(f"Attacking cow entity={eid} at ({cx},{cy})")
+            npc_data = self.state.npcs.get(eid)
+            npc_tid  = npc_data[0] if npc_data else None
+            npc_name = (NPC_NAMES.get(npc_tid, f"type_{npc_tid}")
+                        if npc_tid is not None else f"entity_{eid}")
+            log.info(f"Attacking {npc_name} (eid={eid}) at ({cx},{cy})")
             await self._move(cx, cy)
             # Human reaction before clicking Attack — lognormal, floor 150 ms.
             await asyncio.sleep(_human_reaction())
@@ -1302,6 +1347,7 @@ class Bot:
             deadline    = asyncio.get_event_loop().time() + _combat_timeout
             target_dead = False
             player_dead = False
+            fled        = False
 
             while asyncio.get_event_loop().time() < deadline:
                 if self._ws_closed.is_set():
@@ -1316,8 +1362,37 @@ class Bot:
                 # in the packet inter-arrival histogram during combat.
                 await asyncio.sleep(_jitter(0.50))
 
+                # HP-based flee: disengage if HP drops below 30 %.
+                # Prevents death from multi-aggro or unexpectedly tough targets.
+                if (self.state.max_hp > 0
+                        and self.state.hp > 0
+                        and self.state.hp / self.state.max_hp < 0.30):
+                    fled = True
+                    break
+
+            if fled:
+                bar = _hp_bar(self.state.hp, self.state.max_hp)
+                log.warning(f"HP critical {bar} — fleeing {npc_name}")
+                dx, dy = random.choice([(0, 60), (0, -60), (60, 0), (-60, 0),
+                                        (40, 40), (-40, 40)])
+                try:
+                    await self._move(self.state.x + dx, self.state.y + dy)
+                except Exception:
+                    pass
+                # Wait for HP to recover to ≥ 60 %.
+                t_regen = asyncio.get_event_loop().time() + _jitter(25.0, scale=0.30)
+                while asyncio.get_event_loop().time() < t_regen:
+                    if self._ws_closed.is_set():
+                        raise ConnectionError("WebSocket closed during HP regen wait")
+                    if (not self.state.max_hp
+                            or self.state.hp / self.state.max_hp >= 0.60):
+                        break
+                    await asyncio.sleep(_jitter(2.0))
+                log.info(f"HP recovered {_hp_bar(self.state.hp, self.state.max_hp)} — resuming")
+                continue
+
             if not target_dead and not player_dead:
-                log.warning(f"Combat stalled on cow {eid} — finding new target")
+                log.warning(f"Combat stalled on {npc_name} (eid={eid}) — finding new target")
                 continue
 
             if player_dead:
@@ -1332,7 +1407,9 @@ class Bot:
                 log.info(f"Walking back to cow area ({wx},{wy})")
                 await self._move(wx, wy)
             else:
-                log.info(f"Cow {eid} defeated")
+                hp_s = f"  HP {_hp_bar(self.state.hp, self.state.max_hp)}" if self.state.max_hp else ""
+                log.info(f"KILL     {npc_name} (eid={eid}){hp_s}")
+                self.state._kills += 1
                 # Remove from dead_npcs now that the kill is confirmed — this
                 # prevents the set growing unbounded across many respawn cycles.
                 # If the server reuses this entity ID for a respawned NPC, the
@@ -1439,6 +1516,62 @@ class Bot:
                 except Exception:
                     break
 
+    # ── Status / summary ─────────────────────────────────────────────────────
+
+    async def _status_loop(self):
+        """
+        Emit a periodic one-line status summary (~every 60 s, jittered).
+
+        Covers position, HP bar, session kills/logs, and cumulative XP per
+        skill so an unattended run can be monitored without grepping scroll.
+        """
+        while True:
+            await asyncio.sleep(_jitter(60.0, scale=0.15))
+            if not self._session_start:
+                continue
+            elapsed  = time.monotonic() - self._session_start
+            m, s     = divmod(int(elapsed), 60)
+            hp_s     = (_hp_bar(self.state.hp, self.state.max_hp)
+                        if self.state.max_hp else f"{self.state.hp}/?")
+            xp_parts = [
+                f"{SKILL_NAMES.get(sid, f'sk{sid}')}+{xp:,}"
+                for sid, xp in sorted(self.state._xp_session.items()) if xp > 0
+            ]
+            xp_s = "  ".join(xp_parts) if xp_parts else "—"
+            log.info(
+                f"STATUS   {m}m{s:02d}s  pos=({self.state.x},{self.state.y})  "
+                f"HP {hp_s}  kills={self.state._kills}  logs={self.state.logs_chopped}  "
+                f"XP: {xp_s}"
+            )
+
+    def _print_session_summary(self) -> None:
+        """Print a full session report — called on clean exit or Ctrl+C."""
+        if not self._session_start:
+            return
+        elapsed = time.monotonic() - self._session_start
+        h, rem  = divmod(int(elapsed), 3600)
+        m, s    = divmod(rem, 60)
+        runtime = f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+        hrs     = max(elapsed / 3600, 1e-6)
+
+        log.info("=" * 58)
+        log.info(f"  SESSION COMPLETE   runtime={runtime}")
+        log.info(f"  Kills: {self.state._kills}   Logs chopped: {self.state.logs_chopped}")
+        if self.state._xp_session:
+            log.info("  XP gains this session:")
+            for sid in sorted(self.state._xp_session):
+                xp = self.state._xp_session[sid]
+                if xp == 0:
+                    continue
+                skill = SKILL_NAMES.get(sid, f"skill_{sid}")
+                lvl   = self.state._skill_levels.get(sid, "?")
+                rate  = int(xp / hrs)
+                log.info(f"    {skill:<12s}  lv {str(lvl):<3}  +{xp:>8,} xp  ({rate:,}/hr)")
+        if _unhandled_counts:
+            parts = ", ".join(f"op={k}×{v}" for k, v in sorted(_unhandled_counts.items()))
+            log.info(f"  Unhandled opcodes: {parts}")
+        log.info("=" * 58)
+
     # ── Entry points ─────────────────────────────────────────────────────────
 
     async def run(self, mode: str = "woodcutting"):
@@ -1450,6 +1583,8 @@ class Bot:
                  f"{len(pathfinder._blocked_tiles)} water tiles, "
                  f"{len(pathfinder._heights)} height tiles, "
                  f"{len(pathfinder._dynamic_blocked)} dynamic blocks")
+        log.info(f"Data loaded     — {len(ITEM_NAMES)} items, "
+                 f"{len(OBJECT_DATA)} objects, {len(NPC_NAMES)} NPCs")
 
         self._token, self._device_id, self._device_cookie = await self._http_login()
 
@@ -1472,6 +1607,7 @@ class Bot:
             recv      = asyncio.create_task(self._recv_loop())
             heartbeat = asyncio.create_task(self._heartbeat_loop())
             pos_y     = asyncio.create_task(self._position_y_loop())
+            status    = asyncio.create_task(self._status_loop())
 
             try:
                 await asyncio.wait_for(self.state.ev_login_ok.wait(), timeout=10.0)
@@ -1513,6 +1649,7 @@ class Bot:
                 recv.cancel()
                 heartbeat.cancel()
                 pos_y.cancel()
+                status.cancel()
 
             await ws.close()
 
@@ -1626,7 +1763,12 @@ def main():
 
     mode = args.mode or _select_mode_interactive()
     log.info(f"Starting in {mode} mode")
-    asyncio.run(bot.run(mode))
+    try:
+        asyncio.run(bot.run(mode))
+    except KeyboardInterrupt:
+        log.info("Interrupted by user")
+    finally:
+        bot._print_session_summary()
 
 
 if __name__ == "__main__":
