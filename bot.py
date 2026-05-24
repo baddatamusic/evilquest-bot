@@ -25,6 +25,7 @@ Usage:
 
 import asyncio
 import argparse
+import json
 import logging
 import math
 import os
@@ -168,6 +169,59 @@ DEFAULT_COW_Y = 1720
 
 EQUIP_SLOTS = ["weapon", "shield", "head", "body", "legs", "feet", "cape", "ring", "ammo"]
 
+SKILL_NAMES: dict[int, str] = {
+    0:  "Attack",      1:  "Strength",    2:  "Defence",
+    3:  "Ranged",      4:  "Prayer",      5:  "Magic",
+    6:  "Hitpoints",   7:  "Woodcutting", 8:  "Mining",
+    9:  "Fishing",     10: "Cooking",     11: "Firemaking",
+    12: "Crafting",    13: "Smithing",
+}
+
+
+def _load_item_names() -> dict[int, str]:
+    p = Path("gameassets/data/items.json")
+    if not p.exists():
+        return {}
+    try:
+        rows = json.loads(p.read_text(encoding="utf-8"))
+        rows = rows if isinstance(rows, list) else list(rows.values())
+        return {r["id"]: r.get("name", f"item_{r['id']}") for r in rows if "id" in r}
+    except Exception:
+        return {}
+
+
+def _load_object_data() -> dict[int, dict]:
+    p = Path("gameassets/data/objects.json")
+    if not p.exists():
+        return {}
+    try:
+        rows = json.loads(p.read_text(encoding="utf-8"))
+        rows = rows if isinstance(rows, list) else list(rows.values())
+        return {r["id"]: r for r in rows if "id" in r}
+    except Exception:
+        return {}
+
+
+ITEM_NAMES:  dict[int, str]  = _load_item_names()
+OBJECT_DATA: dict[int, dict] = _load_object_data()
+
+
+def _describe_object(eid: int | None, objects: dict) -> str:
+    """Return a human-readable label for a world object entity."""
+    if eid is None:
+        return "?"
+    obj = objects.get(eid)
+    if obj:
+        tid   = obj[0]
+        odata = OBJECT_DATA.get(tid, {})
+        name  = odata.get("name", f"type_{tid}")
+        skill = odata.get("skill", "")
+        xp    = odata.get("xpReward", 0)
+        extra = f" [{skill} +{xp}xp]" if skill and xp else (f" [{skill}]" if skill else "")
+        return f"{name}{extra} (eid={eid})"
+    return f"entity={eid}"
+
+
 # All opcodes now live in protocol.py as S.* / C.* logical constants.
 # The transport layer translates to/from wire opcodes transparently.
 
@@ -193,6 +247,9 @@ class State:
         self.dialogue_session_id: int = 0
 
         self.equipped: dict[str, int] = {}
+
+        self._xp_session:   dict[int, int] = {}   # skill_id → XP gained this session
+        self._skill_levels: dict[int, int] = {}   # skill_id → current level
 
         self._has_hp_baseline: bool = False
         self._is_dead: bool = False
@@ -410,12 +467,14 @@ class Bot:
                 log.debug(f"COMBAT_HIT attacker={vals[0]} target={vals[1]} dmg={vals[2]}")
 
         elif op == S.SKILLING_START:
-            log.info(f"SKILLING_START {vals}")
+            obj_desc = _describe_object(vals[0] if vals else None, self.state.objects)
+            log.info(f"SKILLING  ▶  {obj_desc}")
             self.state.ev_skilling_start.set()
 
         elif op == S.SKILLING_STOP:
-            log.info(f"SKILLING_STOP {vals}")
-            self.state.logs_chopped    += 1
+            obj_desc = _describe_object(vals[0] if vals else None, self.state.objects)
+            log.info(f"SKILLING  ■  {obj_desc}")
+            self.state.logs_chopped      += 1
             self.state.logs_in_inventory += 1   # logs go directly to inventory
             self.state.ev_skilling_stop.set()
 
@@ -500,22 +559,94 @@ class Bot:
                 log.info(f"PATH_TRUNCATED at ({vals[0]},{vals[1]})")
                 self.ev_path_truncated.set()
 
+        elif op == S.PLAYER_SKILLS_BATCH:
+            # Stride-4 payload: [level, boosted_lvl, 0, xp] per skill, skill_id order.
+            # Sent once on login — used to seed _skill_levels for XP display.
+            stride = 4
+            count  = len(vals) // stride
+            for sid in range(count):
+                base = sid * stride
+                lvl  = vals[base]
+                self.state._skill_levels[sid] = lvl
+                self.state._xp_session.setdefault(sid, 0)
+            parts = [
+                f"{SKILL_NAMES.get(i, f'sk{i}')}={self.state._skill_levels[i]}"
+                for i in range(count)
+            ]
+            log.info("SKILLS   " + "  ".join(parts))
+
         elif op == S.XP_GAIN:
-            log.info(f"XP_GAIN skill={vals[0] if vals else '?'} xp={vals[1] if len(vals)>1 else '?'}")
+            if len(vals) >= 2:
+                sid, xp = vals[0], vals[1]
+                skill = SKILL_NAMES.get(sid, f"skill_{sid}")
+                self.state._xp_session[sid] = self.state._xp_session.get(sid, 0) + xp
+                total = self.state._xp_session[sid]
+                lvl   = self.state._skill_levels.get(sid)
+                lvl_s = f" (lv {lvl})" if lvl is not None else ""
+                log.info(f"XP  +{xp:>4}  {skill:<12s}{lvl_s}  [session: {total:,}]")
+            else:
+                log.info(f"XP_GAIN vals={vals}")
 
         elif op == S.LEVEL_UP:
-            log.info(f"LEVEL_UP {vals}")
+            if len(vals) >= 2:
+                sid, new_lvl = vals[0], vals[1]
+                skill = SKILL_NAMES.get(sid, f"skill_{sid}")
+                self.state._skill_levels[sid] = new_lvl
+                log.info(f"★ LEVEL UP  {skill} → {new_lvl} ★")
+            elif len(vals) == 1:
+                sid   = vals[0]
+                skill = SKILL_NAMES.get(sid, f"skill_{sid}")
+                log.info(f"★ LEVEL UP  {skill} ★")
+            else:
+                log.info(f"LEVEL_UP vals={vals}")
 
         elif op == S.PLAYER_EQUIPMENT:
             self.state.equipped.clear()
+            parts = []
             for i, slot in enumerate(EQUIP_SLOTS):
                 item_id = vals[i] if i < len(vals) else 0
                 if item_id:
                     self.state.equipped[slot] = item_id
-            log.info(f"PLAYER_EQUIPMENT equipped={self.state.equipped}")
+                    parts.append(f"{slot}={ITEM_NAMES.get(item_id, f'item_{item_id}')}")
+            gear = ", ".join(parts) if parts else "none"
+            log.info(f"GEAR     (own)   {gear}")
 
         elif op == S.PLAYER_STATS:
             log.debug(f"PLAYER_STATS vals={vals}")
+
+        elif op == S.PLAYER_REMOTE_EQUIPMENT:
+            # Another player's equipped items: vals=[entity_id, item_id×9_slots]
+            if len(vals) >= 1:
+                eid   = vals[0]
+                slots = vals[1:]
+                parts = []
+                for i, iid in enumerate(slots):
+                    if iid and i < len(EQUIP_SLOTS):
+                        name = ITEM_NAMES.get(iid, f"item_{iid}")
+                        parts.append(f"{EQUIP_SLOTS[i]}={name}")
+                gear = ", ".join(parts) if parts else "none"
+                log.info(f"GEAR     entity={eid:<4}  {gear}")
+
+        elif op == S.NPC_EQUIPMENT:
+            # NPC equipped items — usually all zeros. Silently discard unless equipped.
+            if vals:
+                eid   = vals[0]
+                slots = vals[1:]
+                parts = [ITEM_NAMES.get(iid, f"item_{iid}") for iid in slots if iid]
+                if parts:
+                    log.debug(f"NPC_EQUIP  entity={eid}  {', '.join(parts)}")
+                else:
+                    log.debug(f"NPC_EQUIP  entity={eid}  (none)")
+
+        elif op == S.NPC_CUSTOM_COLORS:
+            # NPC colour palette — cosmetic only, no game logic needed.
+            if vals:
+                log.debug(f"NPC_COLORS entity={vals[0]}  palette={vals[1:]}")
+
+        elif op == S.NPC_ATTACK_ANIM:
+            # NPC playing an attack animation. Useful for combat awareness.
+            if len(vals) >= 2:
+                log.debug(f"NPC_ATTACK_ANIM entity={vals[0]} anim={vals[1]}")
 
         else:
             parsed = try_unpack_str(raw)
