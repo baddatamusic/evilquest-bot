@@ -580,26 +580,12 @@ class Bot:
                 log.debug("TRADE_REQUEST_RECEIVED (no entity id in vals)")
 
         elif op == S.ADMIN_FLAGS:
-            # New server opcode added with the admin-UI anti-cheat system.
-            # The real client receives this and may update local UI state.
-            # Falling through to the generic unhandled logger would generate
-            # a noisy INFO line for a packet the server sends deliberately —
-            # handle it explicitly so it stays at DEBUG level and doesn't
-            # confuse post-session log analysis.
-            if vals:
-                flag_names = {
-                    0: "tickAlignedTiming",
-                    1: "suspiciousPackets",
-                    2: "packetFuzzing",
-                    3: "pathOptimality",
-                    4: "zeroCancellations",
-                    5: "selectivePickup",
-                    6: "noChat",
-                }
-                active = [flag_names.get(v, f"flag_{v}") for v in vals]
-                log.warning(f"ADMIN_FLAGS: {active} — adjust behaviour accordingly")
-            else:
-                log.debug("ADMIN_FLAGS received (empty payload)")
+            # Semantics changed (May 2026 update): now an admin-status packet,
+            # not an anti-cheat signal.  Bit 0 of vals[0] = isAdmin.
+            # Only sent to admin accounts; regular players never receive it.
+            # Keep silent at DEBUG so it doesn't pollute normal run logs.
+            is_admin = bool(vals and (vals[0] & 1))
+            log.debug(f"ADMIN_FLAGS isAdmin={is_admin}")
 
         elif op == S.SERVER_PONG:
             log.debug(f"SERVER_PONG seq={vals[0] if vals else '?'}")

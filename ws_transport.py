@@ -108,7 +108,9 @@ _SERVER_LOGICAL = sorted({
     60, 61, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
     80, 81, 82, 84, 85, 86, 87, 88,
     90, 91, 92, 93, 94, 95,
-    100, 110, 111, 120, 121, 122,
+    100, 110, 111, 121, 122,
+    # 120 (ADMIN_FLAGS) removed from mapping — server changed it to an admin-only
+    # status opcode (bit 0 = isAdmin) and no longer maps it for regular players.
 })
 
 # ── Base64url helpers ─────────────────────────────────────────────────────────
